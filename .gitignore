@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# OS/Editor
+.DS_Store
+.vscode/
+
+# Logs and outputs
+*.log
+slurm-*.out
+
+# Training artifacts
+checkpoints/
+
+# Large datasets (keep structure, skip raw binaries)
+fin_factor/*.npz
+fin_hloc/*.npz
+*.pt
+*.npy
+
+# Optional docs generated during debugging
+CHANGES_SUMMARY.md
