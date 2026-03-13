@@ -43,7 +43,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1):
 
 
 def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers,
-            num_epochs, learning_rate, patience, use_amp, master_addr, master_port, seed):
+            num_epochs, learning_rate, patience, use_amp, master_addr, master_port, seed, data_fraction=1.0):
     try:
         torch.backends.cudnn.benchmark = True
         set_local_seed(seed + rank)
@@ -55,12 +55,13 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
 
         
         # data_path = "./fin_hloc/forex_atr_by_time.npz"
-        data_path = "./fin_hloc/forex_atr_by_time.npz"
+        data_path = "./fin_factor/qualified_samples_external_atr_by_time.npz"
 
         train_dataset, val_dataset, train_size, val_size = create_dataset(
             data_path=data_path, 
             dtype=torch.float32, 
-            rank=rank
+            rank=rank,
+            data_fraction=data_fraction
         )
         if rank == 0:
             print(f"Training set size: {train_size}, Validation set size: {val_size}", flush=True)
@@ -76,7 +77,8 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
         test_dataset, test_size = create_test_dataset(
             data_path=data_path,
             dtype=torch.float32,
-            rank=rank
+            rank=rank,
+            data_fraction=data_fraction
         )
         
         test_loader = None
@@ -219,13 +221,13 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
 
 
 def exp_ddp(world_size, model_class, model_config, batch_size, num_workers,
-            num_epochs, learning_rate, patience, use_amp, master_addr, master_port, seed):
+            num_epochs, learning_rate, patience, use_amp, master_addr, master_port, seed, data_fraction=1.0):
     processes = []
     for rank in range(world_size):
         p = Process(target=exp_rnn, args=(
             rank, world_size, model_class, model_config, batch_size,
             num_workers, num_epochs, learning_rate, patience,
-            use_amp, master_addr, master_port, seed
+            use_amp, master_addr, master_port, seed, data_fraction
         ))
         p.start()
         processes.append(p)

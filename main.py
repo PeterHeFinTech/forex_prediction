@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument('--patience', type=int, default=10)  # 修改：减少patience
     parser.add_argument('--use_amp', action='store_true') 
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--data_fraction', type=float, default=1.0, help='Fraction of train/validation/test data to use (0.0-1.0, e.g., 1/30 ≈ 0.0333)')
     
     # Model parameters - 修改为新模型的参数
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension size')
@@ -82,5 +83,6 @@ if __name__ == "__main__":
         use_amp=args.use_amp,
         master_addr=args.master_addr,
         master_port=args.master_port,
-        seed=args.seed
+        seed=args.seed,
+        data_fraction=args.data_fraction
     )

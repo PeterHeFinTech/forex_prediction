@@ -157,6 +157,7 @@
 
 
 import os
+import zipfile
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -191,13 +192,28 @@ class ForexClassificationDataset(torch.utils.data.Dataset):
         i = self.indices[idx]
         return self.x[i], self.y[i], self.targets[i]
 
-def create_dataset(data_path, dtype, rank, balance_train=True):
+def sample_tensor_triplet(inputs, labels, targets, fraction):
+    total_size = inputs.shape[0]
+    sample_size = max(1, int(total_size * fraction))
+    sample_indices = np.random.choice(total_size, size=sample_size, replace=False)
+    return inputs[sample_indices], labels[sample_indices], targets[sample_indices], sample_size
+
+def create_dataset(data_path, dtype, rank, balance_train=True, data_fraction=1.0):
     """
     参数:
     balance_train (bool): 是否对训练集进行类别平衡（过采样）。默认为 True。
+    data_fraction (float): 要使用的训练数据的比例，范围 0.0-1.0。默认为 1.0（使用全部）。
     """
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Dataset file not found: {data_path}")
+    if not zipfile.is_zipfile(data_path):
+        raise ValueError(
+            f"Dataset file is corrupted or incomplete (not a valid NPZ/ZIP archive): {data_path}"
+        )
+    
+    # 验证data_fraction的有效性
+    if not (0.0 < data_fraction <= 1.0):
+        raise ValueError(f"data_fraction must be in (0.0, 1.0], got {data_fraction}")
     
     # 加载 npz 文件
     raw_data = np.load(data_path)
@@ -215,7 +231,30 @@ def create_dataset(data_path, dtype, rank, balance_train=True):
     val_targets = torch.from_numpy(raw_data['targets_val']).to(dtype)
     
     train_size_original = train_inputs.shape[0]
-    val_size = val_inputs.shape[0]
+    val_size_original = val_inputs.shape[0]
+
+    # --- 数据子采样：根据data_fraction随机选择训练/验证数据 ---
+    if data_fraction < 1.0:
+        train_inputs, train_labels, train_targets, train_size_original = sample_tensor_triplet(
+            train_inputs, train_labels, train_targets, data_fraction
+        )
+        val_inputs, val_labels, val_targets, val_size = sample_tensor_triplet(
+            val_inputs, val_labels, val_targets, data_fraction
+        )
+        
+        if rank == 0:
+            print(
+                f"\n[Data Sampling] Using {data_fraction*100:.2f}% of training data "
+                f"({train_size_original:,}/{raw_data['X_train'].shape[0]:,} samples)",
+                flush=True,
+            )
+            print(
+                f"[Data Sampling] Using {data_fraction*100:.2f}% of validation data "
+                f"({val_size:,}/{val_size_original:,} samples)",
+                flush=True,
+            )
+    else:
+        val_size = val_size_original
 
     # --- 核心修改：生成训练集索引（支持类别平衡）---
     if balance_train:
@@ -274,12 +313,18 @@ def create_dataset(data_path, dtype, rank, balance_train=True):
     return train_dataset, val_dataset, len(train_indices), val_size
 
 
-def create_test_dataset(data_path, dtype, rank):
+def create_test_dataset(data_path, dtype, rank, data_fraction=1.0):
     """
     单独加载测试集
     """
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Dataset file not found: {data_path}")
+    if not zipfile.is_zipfile(data_path):
+        raise ValueError(
+            f"Dataset file is corrupted or incomplete (not a valid NPZ/ZIP archive): {data_path}"
+        )
+    if not (0.0 < data_fraction <= 1.0):
+        raise ValueError(f"data_fraction must be in (0.0, 1.0], got {data_fraction}")
     
     raw_data = np.load(data_path)
     
@@ -291,7 +336,20 @@ def create_test_dataset(data_path, dtype, rank):
     test_inputs = torch.from_numpy(raw_data['X_test']).to(dtype)
     test_labels = torch.from_numpy(raw_data['y_test']).long()
     test_targets = torch.from_numpy(raw_data['targets_test']).to(dtype)
-    test_size = test_inputs.shape[0]
+    test_size_original = test_inputs.shape[0]
+
+    if data_fraction < 1.0:
+        test_inputs, test_labels, test_targets, test_size = sample_tensor_triplet(
+            test_inputs, test_labels, test_targets, data_fraction
+        )
+        if rank == 0:
+            print(
+                f"[Data Sampling] Using {data_fraction*100:.2f}% of test data "
+                f"({test_size:,}/{test_size_original:,} samples)",
+                flush=True,
+            )
+    else:
+        test_size = test_size_original
     
     if rank == 0:
         print(f"\nTest set loaded: {test_size:,} samples", flush=True)

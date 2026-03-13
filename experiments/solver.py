@@ -3,7 +3,17 @@ import torch.distributed as dist
 from torch.amp import autocast
 from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
 import time
-import numpy as np 
+import numpy as np
+import sys
+import os
+
+# Add parent directory to path to import metrics
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.metrics import (
+    sharpe_ratio, portfolio_turnover, net_of_cost_sharpe,
+    long_short_portfolio_returns, cross_entropy_loss, mcfadden_pseudo_r2,
+    annualized_return, annualized_volatility, maximum_drawdown, decile_analysis
+) 
 
 
 
@@ -14,7 +24,6 @@ def trainer(model, train_loader, optimizer, criterion, device, scaler, use_amp, 
     total_correct = 0
     all_predictions = []
     all_labels = []
-    all_returns = []
 
     if rank == 0:
         print(f"\n[Epoch {epoch+1}] Starting training, total batches: {len(train_loader)}", flush=True)
@@ -33,58 +42,7 @@ def trainer(model, train_loader, optimizer, criterion, device, scaler, use_amp, 
         if use_amp:
             with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(inputs)
-                loss_classify = criterion(outputs, labels)
-                
-                # 计算回报损失
-                # 第128天的收盘价 (输入序列的最后一天)
-                price_128 = inputs[:, -1, 3]
-                # 第129天的收盘价 (目标日)
-                price_129 = target_prices[:, 3]
-                
-                # 实际收益率 (%)
-                actual_return_pct = (price_129 - price_128) / (price_128 + 1e-8) * 100
-                
-                # 扣除spread成本 (2 pips = 0.02%)
-                spread_cost_pct = 0.02
-                
-                # 根据预测类别调整return符号（KEY FIX）
-                # 获取模型的argmax预测: 0=DOWN(SHORT), 1=STABLE, 2=UP(LONG)
-                pred_classes = torch.argmax(outputs, dim=1)
-                
-                # 初始化returns_pct
-                returns_pct = torch.zeros_like(actual_return_pct)
-                
-                # UP预测 (pred_classes == 2): return = actual_return - spread
-                up_mask = (pred_classes == 2)
-                returns_pct[up_mask] = actual_return_pct[up_mask] - spread_cost_pct
-                
-                # DOWN预测 (pred_classes == 0): return = -actual_return - spread (做空)
-                down_mask = (pred_classes == 0)
-                returns_pct[down_mask] = -actual_return_pct[down_mask] - spread_cost_pct
-                
-                # STABLE预测 (pred_classes == 1): return = -spread (无头寸或观望)
-                stable_mask = (pred_classes == 1)
-                returns_pct[stable_mask] = -spread_cost_pct
-                
-                # 回报损失：最小化负回报（即最大化正回报）
-                # loss_return = -returns_pct.mean() 对吗？让我们用梯度上升的角度想
-                # 我们想最大化 mean_return，所以loss应该是 -mean_return
-                loss_return = -returns_pct.mean()
-                
-                # Sharpe比率损失：最大化夏普比率（均值/std）
-                # 对于小batch，需要至少2个样本来计算std
-                if batch_size > 1:
-                    mean_return = returns_pct.mean()
-                    std_return = returns_pct.std() + 1e-8  # 避免除以0
-                    # 我们想最大化 sharpe_ratio = mean/std，所以loss应该是 -mean/std
-                    loss_sharpe = -(mean_return / std_return)
-                else:
-                    loss_sharpe = torch.tensor(0.0, device=device)
-                
-                # 联合损失
-                loss = loss_classify + lambda_return * loss_return + lambda_sharpe * loss_sharpe
-                
-                all_returns.extend(returns_pct.detach().cpu().numpy())
+                loss = criterion(outputs, labels)
             
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -93,43 +51,7 @@ def trainer(model, train_loader, optimizer, criterion, device, scaler, use_amp, 
             scaler.update()
         else:
             outputs = model(inputs)
-            loss_classify = criterion(outputs, labels)
-            
-            # 计算回报损失
-            price_128 = inputs[:, -1, 3]
-            price_129 = target_prices[:, 3]
-            actual_return_pct = (price_129 - price_128) / (price_128 + 1e-8) * 100
-            
-            # 扣除spread成本
-            spread_cost_pct = 0.02
-            
-            # 根据预测类别调整return符号（KEY FIX）
-            pred_classes = torch.argmax(outputs, dim=1)
-            returns_pct = torch.zeros_like(actual_return_pct)
-            
-            up_mask = (pred_classes == 2)
-            returns_pct[up_mask] = actual_return_pct[up_mask] - spread_cost_pct
-            
-            down_mask = (pred_classes == 0)
-            returns_pct[down_mask] = -actual_return_pct[down_mask] - spread_cost_pct
-            
-            stable_mask = (pred_classes == 1)
-            returns_pct[stable_mask] = -spread_cost_pct
-            
-            loss_return = -returns_pct.mean()
-            
-            # Sharpe比率损失
-            if batch_size > 1:
-                mean_return = returns_pct.mean()
-                std_return = returns_pct.std() + 1e-8
-                loss_sharpe = -(mean_return / std_return)
-            else:
-                loss_sharpe = torch.tensor(0.0, device=device)
-            
-            # 联合损失
-            loss = loss_classify + lambda_return * loss_return + lambda_sharpe * loss_sharpe
-            
-            all_returns.extend(returns_pct.detach().cpu().numpy())
+            loss = criterion(outputs, labels)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -243,7 +165,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
             
             # 收集评估所需数据
             # inputs shape: [batch, 128, 10] where feature index 3 is close price
-            # target_prices shape: [batch, 4] where index 3 is close price
+            # target_prices shape: [batch, 10] where index 3 is close price
             all_probs.extend(probs.float().cpu().numpy())
             all_labels.extend(labels.cpu().tolist())
             # 第128天的收盘价 (输入序列的最后一天)
@@ -305,9 +227,9 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         # 高置信度交易模拟 (High Confidence Simulation)
         # ==========================================================
         print(f"\n[{dataset_name}] High Confidence Trade Simulation:", flush=True)
-        print(f"{'-'*120}")
-        print(f"{'Threshold':<10} | {'Class':<8} | {'Signals':<8} | {'Win Rate':<10} | {'Capture Rate':<13} | {'Cum Return':<12} | {'Sharpe Ratio':<12}")
-        print(f"{'-'*120}")
+        print(f"{'-'*168}")
+        print(f"{'Threshold':<11}| {'Class':<7}| {'Signals':<8}| {'Win Rate':<10}| {'Capture':<10}| {'Avg Return':<12}| {'Cum Return':<12}| {'Volatility':<12}| {'Sharpe':<11}| {'Max DD':<11}| {'Profit Factor':<14}")
+        print(f"{'-'*168}")
 
         thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
         
@@ -343,17 +265,27 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 returns_pct = actual_return_pct[pred_up_mask] - spread_cost_pct
                 
                 cum_return_pct = np.sum(returns_pct)
+                avg_return_pct = np.mean(returns_pct)
+                volatility_pct = np.std(returns_pct)
                 
                 # 计算 Sharpe Ratio
-                if len(returns_pct) > 1 and np.std(returns_pct) > 0:
+                if len(returns_pct) > 1 and volatility_pct > 0:
                     excess_returns_pct = returns_pct - risk_free_per_trade_pct
-                    sharpe = (np.mean(excess_returns_pct) / np.std(excess_returns_pct)) * np.sqrt(len(excess_returns_pct))
+                    sharpe = (np.mean(excess_returns_pct) / volatility_pct) * np.sqrt(len(returns_pct))
                 else:
                     sharpe = 0.0
                 
-                print(f"{thresh:<10} | {'UP':<8} | {total_up_signals:<8} | {win_rate:6.2f}%   | {capture_rate:6.2f}%      | {cum_return_pct:+7.2f}%      | {sharpe:+7.3f}")
+                # 计算 Maximum Drawdown
+                max_dd_pct = maximum_drawdown(returns_pct / 100) * 100
+                
+                # 计算 Profit Factor (total gains / total losses)
+                gains = returns_pct[returns_pct > 0]
+                losses = returns_pct[returns_pct < 0]
+                profit_factor = np.sum(gains) / abs(np.sum(losses)) if len(losses) > 0 and np.sum(losses) != 0 else float('inf')
+                
+                print(f"{thresh:<11.1f}| {'UP':<7}| {total_up_signals:<8}| {win_rate:8.2f}% | {capture_rate:8.2f}% | {avg_return_pct:+10.4f}% | {cum_return_pct:+10.2f}% | {volatility_pct:10.4f}% | {sharpe:+9.3f} | {max_dd_pct:9.2f}% | {profit_factor:12.2f}")
             else:
-                print(f"{thresh:<10} | {'UP':<8} | {0:<8} | {'N/A':<10} | {'0.00%':<13} | {'N/A':<12} | {'N/A':<12}")
+                print(f"{thresh:<11.1f}| {'UP':<7}| {0:<8}| {'N/A':<10}| {'N/A':<10}| {'N/A':<12}| {'N/A':<12}| {'N/A':<12}| {'N/A':<11}| {'N/A':<11}| {'N/A':<14}")
 
             # --- 分析 Down (跌) ---
             # 条件: 预测是 Down (索引0) 且 概率 > 阈值
@@ -369,26 +301,36 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 capture_rate = (wins / total_true_downs) * 100 if total_true_downs > 0 else 0
                 
                 # 对于DOWN预测（做空/SHORT）：
-                # return = -actual_return - spread
-                # 逻辑: 如果actual_return为负（价格下跌），-actual_return为正（赚钱）
-                # - 如果实际下跌(actual_return < 0)，我们获利（因为做空）
-                # - 如果实际上涨(actual_return > 0)，我们亏损
+                # When we predict DOWN and go SHORT:
+                # - If price actually goes DOWN (actual_return < 0), we PROFIT: -actual_return > 0
+                # - If price actually goes UP (actual_return > 0), we LOSE: -actual_return < 0
+                # The returns can be positive or negative, showing realistic P&L
                 returns_pct = -actual_return_pct[pred_down_mask] - spread_cost_pct
                 
                 cum_return_pct = np.sum(returns_pct)
+                avg_return_pct = np.mean(returns_pct)
+                volatility_pct = np.std(returns_pct)
                 
                 # 计算 Sharpe Ratio
-                if len(returns_pct) > 1 and np.std(returns_pct) > 0:
+                if len(returns_pct) > 1 and volatility_pct > 0:
                     excess_returns_pct = returns_pct - risk_free_per_trade_pct
-                    sharpe = (np.mean(excess_returns_pct) / np.std(excess_returns_pct)) * np.sqrt(len(excess_returns_pct))
+                    sharpe = (np.mean(excess_returns_pct) / volatility_pct) * np.sqrt(len(returns_pct))
                 else:
                     sharpe = 0.0
                 
-                print(f"{thresh:<10} | {'DOWN':<8} | {total_down_signals:<8} | {win_rate:6.2f}%   | {capture_rate:6.2f}%      | {cum_return_pct:+7.2f}%      | {sharpe:+7.3f}")
-            else:
-                print(f"{thresh:<10} | {'DOWN':<8} | {0:<8} | {'N/A':<10} | {'0.00%':<13} | {'N/A':<12} | {'N/A':<12}")
+                # 计算 Maximum Drawdown
+                max_dd_pct = maximum_drawdown(returns_pct / 100) * 100
                 
-            print(f"{'-'*120}")
+                # 计算 Profit Factor
+                gains = returns_pct[returns_pct > 0]
+                losses = returns_pct[returns_pct < 0]
+                profit_factor = np.sum(gains) / abs(np.sum(losses)) if len(losses) > 0 and np.sum(losses) != 0 else float('inf')
+                
+                print(f"{'':<11}| {'DOWN':<7}| {total_down_signals:<8}| {win_rate:8.2f}% | {capture_rate:8.2f}% | {avg_return_pct:+10.4f}% | {cum_return_pct:+10.2f}% | {volatility_pct:10.4f}% | {sharpe:+9.3f} | {max_dd_pct:9.2f}% | {profit_factor:12.2f}")
+            else:
+                print(f"{'':<11}| {'DOWN':<7}| {0:<8}| {'N/A':<10}| {'N/A':<10}| {'N/A':<12}| {'N/A':<12}| {'N/A':<12}| {'N/A':<11}| {'N/A':<11}| {'N/A':<14}")
+                
+            print(f"{'-'*168}")
 
         # ==========================================================
         # 资产定价指标: Decile分析 (Asset Pricing Metrics)
@@ -460,6 +402,80 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         print(f"  Monotonicity (increasing deciles): {monotonic_count}/9 transitions", flush=True)
         print(f"  Best Decile Sharpe: {max(s['sharpe'] for s in decile_stats):+.3f} (D{decile_stats.index(max(decile_stats, key=lambda x: x['sharpe']))+1})", flush=True)
         print(f"  Worst Decile Sharpe: {min(s['sharpe'] for s in decile_stats):+.3f} (D{decile_stats.index(min(decile_stats, key=lambda x: x['sharpe']))+1})", flush=True)
+        
+        # ==========================================================
+        # Additional Comprehensive Metrics
+        # ==========================================================
+        print(f"\n[{dataset_name}] Comprehensive Metrics:", flush=True)
+        print(f"{'-'*80}")
+        
+        # Cross-entropy loss and McFadden's Pseudo R²
+        ce_loss = cross_entropy_loss(np_labels, np_probs[:, 2])  # Using UP class probability
+        pseudo_r2 = mcfadden_pseudo_r2(np_labels == 2, np_probs[:, 2])  # Binary: is UP or not
+        
+        print(f"  Statistical Metrics:", flush=True)
+        print(f"    Cross-Entropy Loss (UP class): {ce_loss:.6f}", flush=True)
+        print(f"    McFadden's Pseudo R² (UP prediction): {pseudo_r2:.6f}", flush=True)
+        
+        # Long-Short Portfolio Returns (using decile 10 vs decile 1)
+        # Construct long-short portfolio
+        long_mask = (up_prob >= np.percentile(up_prob, 90))  # Top 10%
+        short_mask = (up_prob <= np.percentile(up_prob, 10))  # Bottom 10%
+        
+        long_returns = actual_returns[long_mask]
+        short_returns = actual_returns[short_mask]
+        
+        if len(long_returns) > 0 and len(short_returns) > 0:
+            long_short_returns = (long_returns.mean() - short_returns.mean())
+            
+            # Simulate full long-short portfolio returns over time
+            # For simplicity, assume equal weighting across selected assets
+            print(f"\n  Long-Short Portfolio (Top 10% vs Bottom 10%):", flush=True)
+            print(f"    Long (Top 10%) Avg Return: {long_returns.mean():+.4f}%", flush=True)
+            print(f"    Short (Bottom 10%) Avg Return: {short_returns.mean():+.4f}%", flush=True)
+            print(f"    Long-Short Spread: {long_short_returns:+.4f}%", flush=True)
+            
+            # Sharpe ratios
+            if len(long_returns) > 1:
+                long_sharpe = sharpe_ratio(long_returns / 100, periods_per_year=252)  # Convert % to decimal
+                print(f"    Long Portfolio Sharpe: {long_sharpe:.4f}", flush=True)
+            
+            if len(short_returns) > 1:
+                short_sharpe = sharpe_ratio(-short_returns / 100, periods_per_year=252)  # Short position
+                print(f"    Short Portfolio Sharpe: {short_sharpe:.4f}", flush=True)
+        
+        # Full portfolio metrics (all predictions)
+        all_pred_classes = np.argmax(np_probs, axis=1)
+        all_strategy_returns = np.zeros_like(actual_returns)
+        
+        # UP predictions: long position
+        up_pred_mask = (all_pred_classes == 2)
+        all_strategy_returns[up_pred_mask] = actual_returns[up_pred_mask]
+        
+        # DOWN predictions: short position
+        down_pred_mask = (all_pred_classes == 0)
+        all_strategy_returns[down_pred_mask] = -actual_returns[down_pred_mask]
+        
+        # STABLE predictions: no position (0 return minus spread)
+        stable_pred_mask = (all_pred_classes == 1)
+        all_strategy_returns[stable_pred_mask] = -spread_cost_pct
+        
+        if len(all_strategy_returns) > 1:
+            full_sharpe = sharpe_ratio(all_strategy_returns / 100, periods_per_year=252)
+            full_ann_return = annualized_return(all_strategy_returns / 100, periods_per_year=252)
+            full_ann_vol = annualized_volatility(all_strategy_returns / 100, periods_per_year=252)
+            full_max_dd = maximum_drawdown(all_strategy_returns / 100)
+            
+            print(f"\n  Full Strategy Portfolio (All Predictions):", flush=True)
+            print(f"    Sharpe Ratio (Annualized): {full_sharpe:.4f}", flush=True)
+            print(f"    Annualized Return: {full_ann_return*100:.2f}%", flush=True)
+            print(f"    Annualized Volatility: {full_ann_vol*100:.2f}%", flush=True)
+            print(f"    Maximum Drawdown: {full_max_dd*100:.2f}%", flush=True)
+            print(f"    Total Cumulative Return: {np.sum(all_strategy_returns):.2f}%", flush=True)
+            print(f"    Mean Return per Trade: {np.mean(all_strategy_returns):.4f}%", flush=True)
+            print(f"    Win Rate (Positive Returns): {(np.sum(all_strategy_returns > 0) / len(all_strategy_returns)) * 100:.2f}%", flush=True)
+        
+        print(f"{'-'*80}")
 
     # 广播基础指标到所有进程 (保持流程完整性)
     metrics_tensor = torch.tensor([loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted], device=device)
