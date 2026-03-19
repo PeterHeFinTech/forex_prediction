@@ -39,10 +39,8 @@ def parse_args():
     # Model parameters - 修改为新模型的参数
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension size')
     parser.add_argument('--num_layers', type=int, default=3, help='Number of transformer layers')
-    # parser.add_argument('--seq_size', type=int, default=96, help='Sequence length (should match data)')
-    parser.add_argument('--seq_size', type=int, default=128, help='Sequence length (should match data)')
-    parser.add_argument('--num_features', type=int, default=4, help='Number of input features (OHLC)')
-    # parser.add_argument('--num_features', type=int, default=10, help='Number of input features (OHLC)')
+    parser.add_argument('--seq_size', type=int, default=96, help='Sequence length (should match data)')
+    parser.add_argument('--num_features', type=int, default=10, help='Number of input features (already includes factors)')
     parser.add_argument('--num_heads', type=int, default=16, help='Number of attention heads')
     parser.add_argument('--num_classes', type=int, default=3, help='Number of output classes')
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')

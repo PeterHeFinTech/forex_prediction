@@ -243,7 +243,7 @@ def long_short_portfolio_returns(predictions: Union[torch.Tensor, np.ndarray],
     
     return portfolio_returns
 
-
+#思路：把收益率连乘成净值曲线，再看每个时点距离历史最高点跌了多少，取最深那次下跌的绝对值，但是不确定这个指标和不合适放在汇率里
 def cumulative_volatility_adjusted_returns(returns: Union[torch.Tensor, np.ndarray],
                                           target_volatility: float = 0.2,
                                           periods_per_year: int = 252) -> np.ndarray:
@@ -494,6 +494,75 @@ def cross_sectional_correlation(signal_1: Union[torch.Tensor, np.ndarray],
         return float(np.nanmean(correlations))
     else:
         return correlations
+
+
+def rank_information_coefficient(predictions: Union[torch.Tensor, np.ndarray],
+                                 actual_returns: Union[torch.Tensor, np.ndarray]) -> float:
+    """
+    Calculate Rank Information Coefficient (Rank IC).
+
+    Rank IC is the Spearman rank correlation between model scores and realized returns.
+    This is suitable when the model predicts relative trend/ordering rather than exact returns.
+
+    Args:
+        predictions: Predicted scores/probabilities (1D or flattenable)
+        actual_returns: Realized returns (1D or flattenable)
+
+    Returns:
+        Spearman rank correlation in [-1, 1]. Returns 0.0 if undefined.
+    """
+    if isinstance(predictions, torch.Tensor):
+        predictions = predictions.detach().cpu().numpy()
+    if isinstance(actual_returns, torch.Tensor):
+        actual_returns = actual_returns.detach().cpu().numpy()
+
+    predictions = np.asarray(predictions).flatten()
+    actual_returns = np.asarray(actual_returns).flatten()
+
+    if len(predictions) != len(actual_returns) or len(predictions) < 2:
+        return 0.0
+
+    # Remove NaN/Inf pairs
+    valid_mask = np.isfinite(predictions) & np.isfinite(actual_returns)
+    predictions = predictions[valid_mask]
+    actual_returns = actual_returns[valid_mask]
+
+    if len(predictions) < 2:
+        return 0.0
+
+    def _average_tie_ranks(x: np.ndarray) -> np.ndarray:
+        # Stable sort to preserve deterministic tie handling
+        sorter = np.argsort(x, kind='mergesort')
+        sorted_x = x[sorter]
+        n = len(sorted_x)
+        ranks_sorted = np.zeros(n, dtype=float)
+
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and sorted_x[j + 1] == sorted_x[i]:
+                j += 1
+            # 1-based average rank for ties
+            avg_rank = (i + j) / 2.0 + 1.0
+            ranks_sorted[i:j + 1] = avg_rank
+            i = j + 1
+
+        ranks = np.empty(n, dtype=float)
+        ranks[sorter] = ranks_sorted
+        return ranks
+
+    pred_ranks = _average_tie_ranks(predictions)
+    ret_ranks = _average_tie_ranks(actual_returns)
+
+    pred_std = np.std(pred_ranks, ddof=1)
+    ret_std = np.std(ret_ranks, ddof=1)
+    if pred_std < 1e-12 or ret_std < 1e-12:
+        return 0.0
+
+    ric = np.corrcoef(pred_ranks, ret_ranks)[0, 1]
+    if np.isnan(ric):
+        return 0.0
+    return float(ric)
 
 
 # =============================================================================
