@@ -55,7 +55,7 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
 
         
         # data_path = "./fin_hloc/forex_atr_by_time.npz"
-        data_path = "/home/corelabtq/Desktop/Research/forex/fin_factor/forex_atr_by_time96.npz"
+        data_path = "forex/fin_factor/forex_atr_by_time96.npz"
 
         train_dataset, val_dataset, train_size, val_size = create_dataset(
             data_path=data_path, 
