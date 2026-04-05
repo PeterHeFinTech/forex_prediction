@@ -29,8 +29,14 @@ def trainer(model, train_loader, optimizer, criterion, device, scaler, use_amp, 
     if rank == 0:
         print(f"\n[Epoch {epoch+1}] Starting training, total batches: {len(train_loader)}", flush=True)
 
-    for batch_idx, (inputs, labels, target_prices) in enumerate(train_loader):
+    for batch_idx, batch in enumerate(train_loader):
         start_time = time.time()
+
+        # 支持 dataset 返回 (x, y, target, time_id)
+        if len(batch) == 4:
+            inputs, labels, target_prices, _ = batch
+        else:
+            inputs, labels, target_prices = batch
 
         inputs = inputs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -139,8 +145,17 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         print(f"\n[{dataset_name}] Starting evaluation, total batches: {len(val_loader)}", flush=True)
 
     with torch.no_grad():
-        for batch_idx, (inputs, labels, target_prices) in enumerate(val_loader):
+        all_time_ids = []  # 样本对应的时间桶（用于按天聚合）
+
+        for batch_idx, batch in enumerate(val_loader):
             start_time = time.time()
+
+            # 支持 dataset 返回 (x, y, target, time_id)
+            if len(batch) == 4:
+                inputs, labels, target_prices, time_ids = batch
+            else:
+                inputs, labels, target_prices = batch
+                time_ids = None
 
             inputs = inputs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -173,6 +188,8 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
             all_day128_close.extend(inputs[:, -1, 3].float().cpu().numpy())
             # 第129天的收盘价 (目标日)
             all_day129_close.extend(target_prices[:, 3].float().cpu().numpy())
+            if time_ids is not None:
+                all_time_ids.extend(time_ids.cpu().tolist())
             
             duration = time.time() - start_time
 
@@ -200,6 +217,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         np_labels = np.array(all_labels)         # Shape: [N]
         np_day128_close = np.array(all_day128_close)  # Shape: [N]
         np_day129_close = np.array(all_day129_close)  # Shape: [N]
+        np_time_ids = np.array(all_time_ids) if len(all_time_ids) == len(all_labels) and len(all_time_ids) > 0 else None
         
         # 原始的基础预测 (Argmax)
         np_preds = np.argmax(np_probs, axis=1)
@@ -483,26 +501,73 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         stable_pred_mask = (all_pred_classes == 1)
         all_strategy_returns[stable_pred_mask] = 0.0
 
-        all_strategy_returns = all_strategy_returns[~np.isnan(all_strategy_returns)]
-        
-        if len(all_strategy_returns) > 1:
+        valid_trade_mask = ~np.isnan(all_strategy_returns)
+        all_strategy_returns_valid = all_strategy_returns[valid_trade_mask]
+
+        if len(all_strategy_returns_valid) > 1:
             full_sharpe = sharpe_ratio(
-                all_strategy_returns / 100,
+                all_strategy_returns_valid / 100,
                 risk_free_rate=risk_free_annual,
                 periods_per_year=365
             )
-            full_ann_return = annualized_return(all_strategy_returns / 100, periods_per_year=365)
-            full_ann_vol = annualized_volatility(all_strategy_returns / 100, periods_per_year=365)
-            full_max_dd = maximum_drawdown(all_strategy_returns / 100)
+            full_ann_return = annualized_return(all_strategy_returns_valid / 100, periods_per_year=365)
+            full_ann_vol = annualized_volatility(all_strategy_returns_valid / 100, periods_per_year=365)
+            full_max_dd = maximum_drawdown(all_strategy_returns_valid / 100)
             
             print(f"\n  Full Strategy Portfolio (All Predictions):", flush=True)
             print(f"    Sharpe Ratio (Annualized): {full_sharpe:.4f}", flush=True)
             print(f"    Annualized Return: {full_ann_return*100:.2f}%", flush=True)
             print(f"    Annualized Volatility: {full_ann_vol*100:.2f}%", flush=True)
             print(f"    Maximum Drawdown: {full_max_dd*100:.2f}%", flush=True)
-            print(f"    Total Cumulative Return: {np.sum(all_strategy_returns):.2f}%", flush=True)
-            print(f"    Mean Return per Trade: {np.mean(all_strategy_returns):.4f}%", flush=True)
-            print(f"    Win Rate (Positive Returns): {(np.sum(all_strategy_returns > 0) / len(all_strategy_returns)) * 100:.2f}%", flush=True)
+            print(f"    Total Cumulative Return: {np.sum(all_strategy_returns_valid):.2f}%", flush=True)
+            print(f"    Mean Return per Trade: {np.mean(all_strategy_returns_valid):.4f}%", flush=True)
+
+            # 修复：胜率仅统计实际交易信号（UP/DOWN），不把 STABLE(0收益) 计入分母
+            executed_trade_mask = up_pred_mask | down_pred_mask
+            executed_trade_returns = all_strategy_returns[executed_trade_mask]
+            if len(executed_trade_returns) > 0:
+                trade_win_rate = (np.sum(executed_trade_returns > 0) / len(executed_trade_returns)) * 100
+                participation_rate = (len(executed_trade_returns) / len(all_strategy_returns_valid)) * 100
+                print(f"    Win Rate (Executed Trades Only): {trade_win_rate:.2f}%", flush=True)
+                print(f"    Participation Rate (Non-STABLE): {participation_rate:.2f}%", flush=True)
+            else:
+                print(f"    Win Rate (Executed Trades Only): N/A", flush=True)
+
+            # 按天聚合：同一天内多个交易信号先合并为一个日收益，再计算日度 Sharpe
+            if np_time_ids is not None and len(np_time_ids) == len(all_pred_classes):
+                aligned_time_ids = np_time_ids[valid_trade_mask]
+                aligned_returns = all_strategy_returns_valid
+
+                unique_days = np.unique(aligned_time_ids)
+                daily_returns = np.array([
+                    np.mean(aligned_returns[aligned_time_ids == d])
+                    for d in unique_days
+                ])
+
+                if len(daily_returns) > 1:
+                    daily_sharpe = sharpe_ratio(
+                        daily_returns / 100,
+                        risk_free_rate=risk_free_annual,
+                        periods_per_year=365
+                    )
+                    daily_ann_return = annualized_return(daily_returns / 100, periods_per_year=365)
+                    daily_ann_vol = annualized_volatility(daily_returns / 100, periods_per_year=365)
+                    daily_max_dd = maximum_drawdown(daily_returns / 100)
+
+                    print(f"\n  Daily Aggregated Portfolio (Group by Timestamp):", flush=True)
+                    print(f"    Trading Days: {len(unique_days)}", flush=True)
+                    print(f"    Daily Sharpe Ratio (Annualized): {daily_sharpe:.4f}", flush=True)
+                    print(f"    Daily Annualized Return: {daily_ann_return*100:.2f}%", flush=True)
+                    print(f"    Daily Annualized Volatility: {daily_ann_vol*100:.2f}%", flush=True)
+                    print(f"    Daily Maximum Drawdown: {daily_max_dd*100:.2f}%", flush=True)
+                    print(f"    Mean Daily Return: {np.mean(daily_returns):.4f}%", flush=True)
+                else:
+                    if len(unique_days) == 1 and unique_days[0] == -1:
+                        print(f"\n  Daily Aggregated Portfolio: disabled (per-sample timestamp unavailable in dataset)", flush=True)
+                    else:
+                        print(f"\n  Daily Aggregated Portfolio: insufficient grouped daily samples", flush=True)
+            else:
+                print(f"\n  Daily Aggregated Portfolio: timestamp not available/aligned, skipped", flush=True)
         
         print(f"{'-'*80}")
 
@@ -512,5 +577,5 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
     
     # 解包
     loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted = metrics_tensor.tolist()
-
+    
     return loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted

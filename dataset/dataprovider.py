@@ -177,10 +177,11 @@ def report_memory(prefix=""):
     print(f"{prefix}Current RAM usage: {mem:.2f} GB", flush=True)
 
 class ForexClassificationDataset(torch.utils.data.Dataset):
-    def __init__(self, inputs, labels, targets, indices):
+    def __init__(self, inputs, labels, targets, time_ids, indices):
         self.x = inputs
         self.y = labels
         self.targets = targets  # 第129天的OHLC价格
+        self.time_ids = time_ids  # 每个样本所属时间桶（用于按天聚合评估）
         self.indices = indices
 
     def __len__(self):
@@ -190,13 +191,76 @@ class ForexClassificationDataset(torch.utils.data.Dataset):
         # 通过重采样后的索引列表来访问原始数据
         # 这样即使数据被多次采样，也不需要复制物理内存中的 Tensor
         i = self.indices[idx]
-        return self.x[i], self.y[i], self.targets[i]
+        return self.x[i], self.y[i], self.targets[i], self.time_ids[i]
 
-def sample_tensor_triplet(inputs, labels, targets, fraction):
+def sample_tensor_quadruplet(inputs, labels, targets, time_ids, fraction):
     total_size = inputs.shape[0]
     sample_size = max(1, int(total_size * fraction))
     sample_indices = np.random.choice(total_size, size=sample_size, replace=False)
-    return inputs[sample_indices], labels[sample_indices], targets[sample_indices], sample_size
+    return inputs[sample_indices], labels[sample_indices], targets[sample_indices], time_ids[sample_indices], sample_size
+
+
+def _to_time_ids(arr):
+    """
+    将任意 timestamp 数组映射为 int64 time_id，便于 DataLoader 和按天聚合。
+    """
+    arr = np.asarray(arr).reshape(-1)
+
+    if np.issubdtype(arr.dtype, np.datetime64):
+        return arr.astype('datetime64[s]').astype(np.int64)
+    if np.issubdtype(arr.dtype, np.number):
+        return arr.astype(np.int64)
+
+    # 字符串/对象类型：按唯一值编码，保持同一时间戳映射到同一 id
+    _, inverse = np.unique(arr.astype(str), return_inverse=True)
+    return inverse.astype(np.int64)
+
+
+def _build_split_time_ids(raw_data, train_size, val_size, test_size, rank):
+    """
+    构建 train/val/test 对齐的 time_id。优先使用 split 级字段；
+    若只有 timestamp，则按可推断规则切分；否则退化为样本索引。
+    """
+    split_key_candidates = [
+        ('timestamp_train', 'timestamp_val', 'timestamp_test'),
+        ('timestamps_train', 'timestamps_val', 'timestamps_test'),
+        ('time_train', 'time_val', 'time_test'),
+        ('times_train', 'times_val', 'times_test'),
+    ]
+
+    for k_train, k_val, k_test in split_key_candidates:
+        if all(k in raw_data for k in (k_train, k_val, k_test)):
+            return (
+                _to_time_ids(raw_data[k_train]),
+                _to_time_ids(raw_data[k_val]),
+                _to_time_ids(raw_data[k_test]),
+            )
+
+    if 'timestamp' in raw_data:
+        ts = np.asarray(raw_data['timestamp']).reshape(-1)
+        total = train_size + val_size + test_size
+
+        if len(ts) == total:
+            ts_train = ts[:train_size]
+            ts_val = ts[train_size:train_size + val_size]
+            ts_test = ts[train_size + val_size:]
+            return _to_time_ids(ts_train), _to_time_ids(ts_val), _to_time_ids(ts_test)
+
+        if rank == 0:
+            print(
+                f"[Timestamp Warning] Found 'timestamp' with length={len(ts)}, "
+                f"cannot align to splits ({train_size}, {val_size}, {test_size}). "
+                f"Timestamp appears to be dataset-level metadata (e.g., generation time), "
+                f"not per-sample time. Daily aggregation will be disabled.",
+                flush=True,
+            )
+
+    # fallback：使用哨兵 time_id（全部为 -1），显式禁用按天聚合，避免伪时间结果
+    return (
+        np.full(train_size, -1, dtype=np.int64),
+        np.full(val_size, -1, dtype=np.int64),
+        np.full(test_size, -1, dtype=np.int64),
+    )
 
 def create_dataset(data_path, dtype, rank, balance_train=True, data_fraction=1.0):
     """
@@ -225,21 +289,33 @@ def create_dataset(data_path, dtype, rank, balance_train=True, data_fraction=1.0
     train_inputs = torch.from_numpy(raw_data['X_train']).to(dtype)
     train_labels = torch.from_numpy(raw_data['y_train']).long()
     train_targets = torch.from_numpy(raw_data['targets_train']).to(dtype)  # 第129天价格
-    
+
     val_inputs = torch.from_numpy(raw_data['X_val']).to(dtype)
     val_labels = torch.from_numpy(raw_data['y_val']).long()
     val_targets = torch.from_numpy(raw_data['targets_val']).to(dtype)
+
+    test_size_for_time = raw_data['X_test'].shape[0] if 'X_test' in raw_data else 0
+    train_time_ids_np, val_time_ids_np, _ = _build_split_time_ids(
+        raw_data,
+        train_inputs.shape[0],
+        val_inputs.shape[0],
+        test_size_for_time,
+        rank,
+    )
+
+    train_time_ids = torch.from_numpy(train_time_ids_np).long()
+    val_time_ids = torch.from_numpy(val_time_ids_np).long()
     
     train_size_original = train_inputs.shape[0]
     val_size_original = val_inputs.shape[0]
 
     # --- 数据子采样：根据data_fraction随机选择训练/验证数据 ---
     if data_fraction < 1.0:
-        train_inputs, train_labels, train_targets, train_size_original = sample_tensor_triplet(
-            train_inputs, train_labels, train_targets, data_fraction
+        train_inputs, train_labels, train_targets, train_time_ids, train_size_original = sample_tensor_quadruplet(
+            train_inputs, train_labels, train_targets, train_time_ids, data_fraction
         )
-        val_inputs, val_labels, val_targets, val_size = sample_tensor_triplet(
-            val_inputs, val_labels, val_targets, data_fraction
+        val_inputs, val_labels, val_targets, val_time_ids, val_size = sample_tensor_quadruplet(
+            val_inputs, val_labels, val_targets, val_time_ids, data_fraction
         )
         
         if rank == 0:
@@ -294,8 +370,8 @@ def create_dataset(data_path, dtype, rank, balance_train=True, data_fraction=1.0
     val_indices = np.arange(val_size)
     
     # 创建 Dataset - 添加 targets
-    train_dataset = ForexClassificationDataset(train_inputs, train_labels, train_targets, train_indices)
-    val_dataset = ForexClassificationDataset(val_inputs, val_labels, val_targets, val_indices)
+    train_dataset = ForexClassificationDataset(train_inputs, train_labels, train_targets, train_time_ids, train_indices)
+    val_dataset = ForexClassificationDataset(val_inputs, val_labels, val_targets, val_time_ids, val_indices)
     
     if rank == 0:
         print(f"\nDataset loaded & processed:", flush=True)
@@ -336,11 +412,22 @@ def create_test_dataset(data_path, dtype, rank, data_fraction=1.0):
     test_inputs = torch.from_numpy(raw_data['X_test']).to(dtype)
     test_labels = torch.from_numpy(raw_data['y_test']).long()
     test_targets = torch.from_numpy(raw_data['targets_test']).to(dtype)
+
+    train_size_for_time = raw_data['X_train'].shape[0] if 'X_train' in raw_data else 0
+    val_size_for_time = raw_data['X_val'].shape[0] if 'X_val' in raw_data else 0
+    _, _, test_time_ids_np = _build_split_time_ids(
+        raw_data,
+        train_size_for_time,
+        val_size_for_time,
+        test_inputs.shape[0],
+        rank,
+    )
+    test_time_ids = torch.from_numpy(test_time_ids_np).long()
     test_size_original = test_inputs.shape[0]
 
     if data_fraction < 1.0:
-        test_inputs, test_labels, test_targets, test_size = sample_tensor_triplet(
-            test_inputs, test_labels, test_targets, data_fraction
+        test_inputs, test_labels, test_targets, test_time_ids, test_size = sample_tensor_quadruplet(
+            test_inputs, test_labels, test_targets, test_time_ids, data_fraction
         )
         if rank == 0:
             print(
@@ -355,7 +442,7 @@ def create_test_dataset(data_path, dtype, rank, data_fraction=1.0):
         print(f"\nTest set loaded: {test_size:,} samples", flush=True)
     
     test_indices = np.arange(test_size)
-    test_dataset = ForexClassificationDataset(test_inputs, test_labels, test_targets, test_indices)
+    test_dataset = ForexClassificationDataset(test_inputs, test_labels, test_targets, test_time_ids, test_indices)
     
     return test_dataset, test_size
 
