@@ -32,8 +32,10 @@ def trainer(model, train_loader, optimizer, criterion, device, scaler, use_amp, 
     for batch_idx, batch in enumerate(train_loader):
         start_time = time.time()
 
-        # 支持 dataset 返回 (x, y, target, time_id)
-        if len(batch) == 4:
+        # 支持 dataset 返回 (x, y, target), (x, y, target, time_id), (x, y, target, time_id, pair_name)
+        if len(batch) >= 5:
+            inputs, labels, target_prices, _, _ = batch
+        elif len(batch) == 4:
             inputs, labels, target_prices, _ = batch
         else:
             inputs, labels, target_prices = batch
@@ -140,6 +142,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
     all_labels = []
     all_day128_close = []  # 第128天收盘价 (输入序列最后一天)
     all_day129_close = []  # 第129天收盘价 (目标日)
+    all_pair_names = []
 
     if rank == 0:
         print(f"\n[{dataset_name}] Starting evaluation, total batches: {len(val_loader)}", flush=True)
@@ -150,12 +153,17 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         for batch_idx, batch in enumerate(val_loader):
             start_time = time.time()
 
-            # 支持 dataset 返回 (x, y, target, time_id)
-            if len(batch) == 4:
+            # 支持 dataset 返回:
+            # (x, y, target), (x, y, target, time_id), (x, y, target, time_id, pair_name)
+            if len(batch) >= 5:
+                inputs, labels, target_prices, time_ids, pair_names = batch
+            elif len(batch) == 4:
                 inputs, labels, target_prices, time_ids = batch
+                pair_names = None
             else:
                 inputs, labels, target_prices = batch
                 time_ids = None
+                pair_names = None
 
             inputs = inputs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -190,6 +198,11 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
             all_day129_close.extend(target_prices[:, 3].float().cpu().numpy())
             if time_ids is not None:
                 all_time_ids.extend(time_ids.cpu().tolist())
+            if pair_names is not None:
+                if isinstance(pair_names, (list, tuple)):
+                    all_pair_names.extend([str(x) for x in pair_names])
+                else:
+                    all_pair_names.extend([str(x) for x in pair_names.cpu().tolist()])
             
             duration = time.time() - start_time
 
@@ -218,6 +231,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         np_day128_close = np.array(all_day128_close)  # Shape: [N]
         np_day129_close = np.array(all_day129_close)  # Shape: [N]
         np_time_ids = np.array(all_time_ids) if len(all_time_ids) == len(all_labels) and len(all_time_ids) > 0 else None
+        np_pair_names = np.array(all_pair_names, dtype=object) if len(all_pair_names) == len(all_labels) and len(all_pair_names) > 0 else None
         
         # 原始的基础预测 (Argmax)
         np_preds = np.argmax(np_probs, axis=1)
@@ -568,6 +582,63 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                         print(f"\n  Daily Aggregated Portfolio: insufficient grouped daily samples", flush=True)
             else:
                 print(f"\n  Daily Aggregated Portfolio: timestamp not available/aligned, skipped", flush=True)
+
+            # ==========================================================
+            # Major Currency Pairs Only (0.5 pip spread, trade UP/DOWN only)
+            # ==========================================================
+            if np_pair_names is not None and len(np_pair_names) == len(all_pred_classes):
+                major_pairs = {
+                    'EURUSD', 'JPYUSD', 'GBPUSD', 'CHFUSD',
+                    'AUDUSD', 'CADUSD', 'NZDUSD',
+                    'USDEUR', 'USDJPY', 'USDGBP', 'USDCHF',
+                    'USDAUD', 'USDCAD', 'USDNZD'
+                }
+                major_mask = np.isin(np_pair_names, list(major_pairs))
+                major_count = int(np.sum(major_mask))
+
+                if major_count > 1:
+                    major_spread_cost_pct = 0.005  # 0.5 pip
+
+                    major_up_returns = actual_return_pct - major_spread_cost_pct
+                    major_down_returns = -actual_return_pct - major_spread_cost_pct
+
+                    major_strategy_returns = np.full_like(actual_return_pct, np.nan, dtype=float)
+                    major_up_trade_mask = major_mask & (all_pred_classes == 2)
+                    major_down_trade_mask = major_mask & (all_pred_classes == 0)
+                    major_strategy_returns[major_up_trade_mask] = major_up_returns[major_up_trade_mask]
+                    major_strategy_returns[major_down_trade_mask] = major_down_returns[major_down_trade_mask]
+
+                    major_exec_mask = ~np.isnan(major_strategy_returns)
+                    major_exec_returns = major_strategy_returns[major_exec_mask]
+
+                    print(f"\n  Major Pairs Strategy (UP/DOWN only, 0.5 pip spread):", flush=True)
+                    print(f"    Covered Samples (major pairs): {major_count}", flush=True)
+                    print(f"    Executed Trades: {len(major_exec_returns)}", flush=True)
+
+                    if len(major_exec_returns) > 1:
+                        major_sharpe = sharpe_ratio(
+                            major_exec_returns / 100,
+                            risk_free_rate=risk_free_annual,
+                            periods_per_year=365
+                        )
+                        major_ann_return = annualized_return(major_exec_returns / 100, periods_per_year=365)
+                        major_ann_vol = annualized_volatility(major_exec_returns / 100, periods_per_year=365)
+                        major_max_dd = maximum_drawdown(major_exec_returns / 100)
+                        major_win_rate = (np.sum(major_exec_returns > 0) / len(major_exec_returns)) * 100
+
+                        print(f"    Sharpe Ratio (Annualized): {major_sharpe:.4f}", flush=True)
+                        print(f"    Annualized Return: {major_ann_return*100:.2f}%", flush=True)
+                        print(f"    Annualized Volatility: {major_ann_vol*100:.2f}%", flush=True)
+                        print(f"    Maximum Drawdown: {major_max_dd*100:.2f}%", flush=True)
+                        print(f"    Total Cumulative Return: {np.sum(major_exec_returns):.2f}%", flush=True)
+                        print(f"    Mean Return per Trade: {np.mean(major_exec_returns):.4f}%", flush=True)
+                        print(f"    Win Rate (Executed Trades Only): {major_win_rate:.2f}%", flush=True)
+                    else:
+                        print(f"    Insufficient executed major-pair trades for metric calculation", flush=True)
+                else:
+                    print(f"\n  Major Pairs Strategy: no major-pair samples found in this split", flush=True)
+            else:
+                print(f"\n  Major Pairs Strategy: pair names unavailable, skipped", flush=True)
         
         print(f"{'-'*80}")
 
