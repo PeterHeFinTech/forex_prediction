@@ -232,6 +232,9 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         np_day129_close = np.array(all_day129_close)  # Shape: [N]
         np_time_ids = np.array(all_time_ids) if len(all_time_ids) == len(all_labels) and len(all_time_ids) > 0 else None
         np_pair_names = np.array(all_pair_names, dtype=object) if len(all_pair_names) == len(all_labels) and len(all_pair_names) > 0 else None
+        np_pair_names_norm = None
+        if np_pair_names is not None:
+            np_pair_names_norm = np.char.replace(np.char.upper(np_pair_names.astype(str)), '/', '')
         
         # 原始的基础预测 (Argmax)
         np_preds = np.argmax(np_probs, axis=1)
@@ -256,6 +259,31 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         print(f"  True Stable    {conf_matrix[1,0]:7d}     {conf_matrix[1,1]:7d}   {conf_matrix[1,2]:7d}", flush=True)
         print(f"  True Up        {conf_matrix[2,0]:7d}     {conf_matrix[2,1]:7d}   {conf_matrix[2,2]:7d}", flush=True)
 
+        # 过滤极小价格样本，避免收益率分母过小导致异常超大百分比
+        min_valid_price = 1e-4
+        valid_price_mask = (np_day128_close >= min_valid_price)
+        removed_count = int(np.sum(~valid_price_mask))
+        kept_count = int(np.sum(valid_price_mask))
+
+        if removed_count > 0:
+            print(
+                f"\n  Return-Metric Filter: removed {removed_count} samples with day128_close < {min_valid_price} "
+                f"({removed_count / len(np_day128_close) * 100:.2f}%), kept {kept_count}",
+                flush=True
+            )
+
+        np_probs = np_probs[valid_price_mask]
+        np_labels = np_labels[valid_price_mask]
+        np_day128_close = np_day128_close[valid_price_mask]
+        np_day129_close = np_day129_close[valid_price_mask]
+        if np_time_ids is not None:
+            np_time_ids = np_time_ids[valid_price_mask]
+        if np_pair_names_norm is not None:
+            np_pair_names_norm = np_pair_names_norm[valid_price_mask]
+
+        if len(np_probs) <= 1:
+            print(f"\n[{dataset_name}] Return-based metrics may be unstable: insufficient samples after price filtering", flush=True)
+
         # ==========================================================
         # 高置信度交易模拟 (High Confidence Simulation)
         # ==========================================================
@@ -265,14 +293,35 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         print(f"{'-'*168}")
 
         thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
-        
+
         # 计算真实百分比收益: day 129 vs day 128
         # actual_return_pct = (price_129 - price_128) / price_128 * 100
         actual_return_pct = (np_day129_close - np_day128_close) / np_day128_close * 100
-        
+
+        # 过滤异常超大收益（通常由极小分母或坏点导致），避免统计量失真与 inf/nan
+        max_abs_return_pct = 200.0
+        valid_return_mask = np.isfinite(actual_return_pct) & (np.abs(actual_return_pct) <= max_abs_return_pct)
+        outlier_removed = int(np.sum(~valid_return_mask))
+        if outlier_removed > 0:
+            print(
+                f"  Return Outlier Filter: removed {outlier_removed} samples with |return| > {max_abs_return_pct:.1f}% "
+                f"({outlier_removed / len(actual_return_pct) * 100:.2f}%)",
+                flush=True
+            )
+
+            np_probs = np_probs[valid_return_mask]
+            np_labels = np_labels[valid_return_mask]
+            np_day128_close = np_day128_close[valid_return_mask]
+            np_day129_close = np_day129_close[valid_return_mask]
+            actual_return_pct = actual_return_pct[valid_return_mask]
+            if np_time_ids is not None:
+                np_time_ids = np_time_ids[valid_return_mask]
+            if np_pair_names_norm is not None:
+                np_pair_names_norm = np_pair_names_norm[valid_return_mask]
+
         # 2 pip spread成本 (约0.02%)
         spread_cost_pct = 0.02
-        
+
         # 无风险利率: 年化 2%
         risk_free_annual = 0.02
         
@@ -369,6 +418,95 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 print(f"{'':<11}| {'DOWN':<7}| {0:<8}| {'N/A':<10}| {'N/A':<10}| {'N/A':<12}| {'N/A':<12}| {'N/A':<12}| {'N/A':<11}| {'N/A':<11}| {'N/A':<14}")
                 
             print(f"{'-'*168}")
+
+        # ==========================================================
+        # 高置信度交易模拟 - 仅主流货币对 (Major Pairs)
+        # ==========================================================
+        if np_pair_names_norm is not None and len(np_pair_names_norm) == len(np_probs):
+            major_pairs_norm = {
+                'EURUSD', 'USDJPY', 'GBPUSD', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
+                'JPYUSD', 'CHFUSD', 'CADUSD', 'USDEUR', 'USDGBP', 'USDAUD', 'USDNZD'
+            }
+            major_mask_hc = np.isin(np_pair_names_norm, list(major_pairs_norm))
+            major_total = int(np.sum(major_mask_hc))
+
+            print(f"\n[{dataset_name}] High Confidence Trade Simulation (Major Pairs Only):", flush=True)
+            print(f"  Covered Samples (major pairs): {major_total}", flush=True)
+            print(f"{'-'*168}")
+            print(f"{'Threshold':<11}| {'Class':<7}| {'Signals':<8}| {'Win Rate':<10}| {'Capture':<10}| {'Avg Return':<12}| {'Cum Return':<12}| {'Volatility':<12}| {'Sharpe':<11}| {'Max DD':<11}| {'Profit Factor':<14}")
+            print(f"{'-'*168}")
+
+            total_true_ups_major = np.sum((np_labels == 2) & major_mask_hc)
+            total_true_downs_major = np.sum((np_labels == 0) & major_mask_hc)
+
+            for thresh in thresholds:
+                # --- UP (LONG) on major pairs only ---
+                pred_up_mask_major = (np_probs[:, 2] > thresh) & major_mask_hc
+                total_up_signals_major = np.sum(pred_up_mask_major)
+
+                if total_up_signals_major > 0:
+                    wins = np.sum((np_labels == 2) & pred_up_mask_major)
+                    win_rate = (wins / total_up_signals_major) * 100
+                    capture_rate = (wins / total_true_ups_major) * 100 if total_true_ups_major > 0 else 0
+
+                    returns_pct = actual_return_pct[pred_up_mask_major] - spread_cost_pct
+                    cum_return_pct = np.sum(returns_pct)
+                    avg_return_pct = np.mean(returns_pct)
+                    volatility_pct = np.std(returns_pct)
+
+                    if len(returns_pct) > 1 and volatility_pct > 0:
+                        sharpe = sharpe_ratio(
+                            returns_pct / 100,
+                            risk_free_rate=risk_free_annual,
+                            periods_per_year=365
+                        )
+                    else:
+                        sharpe = 0.0
+
+                    max_dd_pct = maximum_drawdown(returns_pct / 100) * 100
+                    gains = returns_pct[returns_pct > 0]
+                    losses = returns_pct[returns_pct < 0]
+                    profit_factor = np.sum(gains) / abs(np.sum(losses)) if len(losses) > 0 and np.sum(losses) != 0 else float('inf')
+
+                    print(f"{thresh:<11.1f}| {'UP':<7}| {total_up_signals_major:<8}| {win_rate:8.2f}% | {capture_rate:8.2f}% | {avg_return_pct:+10.4f}% | {cum_return_pct:+10.2f}% | {volatility_pct:10.4f}% | {sharpe:+9.3f} | {max_dd_pct:9.2f}% | {profit_factor:12.2f}")
+                else:
+                    print(f"{thresh:<11.1f}| {'UP':<7}| {0:<8}| {'N/A':<10}| {'N/A':<10}| {'N/A':<12}| {'N/A':<12}| {'N/A':<12}| {'N/A':<11}| {'N/A':<11}| {'N/A':<14}")
+
+                # --- DOWN (SHORT) on major pairs only ---
+                pred_down_mask_major = (np_probs[:, 0] > thresh) & major_mask_hc
+                total_down_signals_major = np.sum(pred_down_mask_major)
+
+                if total_down_signals_major > 0:
+                    wins = np.sum((np_labels == 0) & pred_down_mask_major)
+                    win_rate = (wins / total_down_signals_major) * 100
+                    capture_rate = (wins / total_true_downs_major) * 100 if total_true_downs_major > 0 else 0
+
+                    returns_pct = -actual_return_pct[pred_down_mask_major] - spread_cost_pct
+                    cum_return_pct = np.sum(returns_pct)
+                    avg_return_pct = np.mean(returns_pct)
+                    volatility_pct = np.std(returns_pct)
+
+                    if len(returns_pct) > 1 and volatility_pct > 0:
+                        sharpe = sharpe_ratio(
+                            returns_pct / 100,
+                            risk_free_rate=risk_free_annual,
+                            periods_per_year=365
+                        )
+                    else:
+                        sharpe = 0.0
+
+                    max_dd_pct = maximum_drawdown(returns_pct / 100) * 100
+                    gains = returns_pct[returns_pct > 0]
+                    losses = returns_pct[returns_pct < 0]
+                    profit_factor = np.sum(gains) / abs(np.sum(losses)) if len(losses) > 0 and np.sum(losses) != 0 else float('inf')
+
+                    print(f"{'':<11}| {'DOWN':<7}| {total_down_signals_major:<8}| {win_rate:8.2f}% | {capture_rate:8.2f}% | {avg_return_pct:+10.4f}% | {cum_return_pct:+10.2f}% | {volatility_pct:10.4f}% | {sharpe:+9.3f} | {max_dd_pct:9.2f}% | {profit_factor:12.2f}")
+                else:
+                    print(f"{'':<11}| {'DOWN':<7}| {0:<8}| {'N/A':<10}| {'N/A':<10}| {'N/A':<12}| {'N/A':<12}| {'N/A':<12}| {'N/A':<11}| {'N/A':<11}| {'N/A':<14}")
+
+                print(f"{'-'*168}")
+        else:
+            print(f"\n[{dataset_name}] High Confidence Trade Simulation (Major Pairs Only): pair names unavailable, skipped", flush=True)
 
         # ==========================================================
         # 资产定价指标: Decile分析 (Asset Pricing Metrics)
@@ -586,14 +724,14 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
             # ==========================================================
             # Major Currency Pairs Only (0.5 pip spread, trade UP/DOWN only)
             # ==========================================================
-            if np_pair_names is not None and len(np_pair_names) == len(all_pred_classes):
+            if np_pair_names_norm is not None and len(np_pair_names_norm) == len(all_pred_classes):
                 major_pairs = {
                     'EURUSD', 'JPYUSD', 'GBPUSD', 'CHFUSD',
                     'AUDUSD', 'CADUSD', 'NZDUSD',
                     'USDEUR', 'USDJPY', 'USDGBP', 'USDCHF',
                     'USDAUD', 'USDCAD', 'USDNZD'
                 }
-                major_mask = np.isin(np_pair_names, list(major_pairs))
+                major_mask = np.isin(np_pair_names_norm, list(major_pairs))
                 major_count = int(np.sum(major_mask))
 
                 if major_count > 1:
