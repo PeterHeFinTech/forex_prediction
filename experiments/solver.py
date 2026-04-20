@@ -10,11 +10,106 @@ import os
 # Add parent directory to path to import metrics
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.metrics import (
-    sharpe_ratio, portfolio_turnover, net_of_cost_sharpe,
+    portfolio_turnover, net_of_cost_sharpe,
     long_short_portfolio_returns, cross_entropy_loss, mcfadden_pseudo_r2,
-    annualized_return, annualized_volatility, maximum_drawdown, decile_analysis,
+    decile_analysis,
     rank_information_coefficient
 ) 
+
+TRADING_DAYS_PER_YEAR = 261
+
+
+def additive_max_drawdown(returns, time_ids=None, aggregate_by_time=True):
+    """
+    以“简单累加”方式计算最大回撤：
+      equity_t = 1 + cumsum(return_t)
+    然后按 running peak 计算回撤比例。
+
+    参数 returns 使用小数收益率（例如 1% -> 0.01）。
+    若提供 time_ids，则先按时间排序；当 aggregate_by_time=True 时，
+    同一 time_id 的收益先做均值聚合，再计算回撤。
+    """
+    r = np.asarray(returns, dtype=np.float64).reshape(-1)
+    if r.size <= 1:
+        return 0.0
+
+    valid_mask = np.isfinite(r)
+    if time_ids is not None:
+        t = np.asarray(time_ids).reshape(-1)
+        if t.size == r.size:
+            valid_mask = valid_mask & np.isfinite(t)
+            r = r[valid_mask]
+            t = t[valid_mask]
+
+            if r.size <= 1:
+                return 0.0
+
+            order = np.argsort(t, kind='mergesort')
+            r = r[order]
+            t = t[order]
+
+            if aggregate_by_time:
+                uniq_t, inverse = np.unique(t, return_inverse=True)
+                sums = np.bincount(inverse, weights=r)
+                counts = np.bincount(inverse)
+                r = sums / np.maximum(counts, 1)
+        else:
+            r = r[valid_mask]
+    else:
+        r = r[valid_mask]
+
+    if r.size <= 1:
+        return 0.0
+
+    equity = 1.0 + np.cumsum(r)
+    running_peak = np.maximum.accumulate(equity)
+    drawdowns = (equity - running_peak) / np.maximum(running_peak, 1e-12)
+    return float(abs(np.min(drawdowns)))
+
+
+def _sanitize_returns(returns):
+    r = np.asarray(returns, dtype=np.float64).reshape(-1)
+    return r[np.isfinite(r)]
+
+
+def additive_sharpe_ratio(returns, risk_free_rate=0.0, periods_per_year=TRADING_DAYS_PER_YEAR, annualize=True):
+    """
+    Additive Sharpe（算术口径）：
+      SR = mean(r - rf/P) / std(r - rf/P)
+    """
+    r = _sanitize_returns(returns)
+    if r.size <= 1:
+        return 0.0
+
+    rf_per_period = risk_free_rate / periods_per_year
+    excess = r - rf_per_period
+    std_excess = np.std(excess, ddof=1)
+    if std_excess <= 1e-12:
+        return 0.0
+
+    sr = np.mean(excess) / std_excess
+    if annualize:
+        sr = sr * np.sqrt(periods_per_year)
+    return float(sr)
+
+
+def additive_annualized_return(returns, periods_per_year=TRADING_DAYS_PER_YEAR):
+    """
+    Additive annualized return（算术口径）：
+      E[r]_annual = mean(r_period) * P
+    """
+    r = _sanitize_returns(returns)
+    if r.size == 0:
+        return 0.0
+    return float(np.mean(r) * periods_per_year)
+
+
+def additive_annualized_volatility(returns, periods_per_year=TRADING_DAYS_PER_YEAR):
+    """Annualized volatility（标准差缩放）"""
+    r = _sanitize_returns(returns)
+    if r.size <= 1:
+        return 0.0
+    return float(np.std(r, ddof=1) * np.sqrt(periods_per_year))
 
 
 
@@ -351,16 +446,17 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 
                 # 计算 Sharpe Ratio（统一口径：年化 Sharpe）
                 if len(returns_pct) > 1 and volatility_pct > 0:
-                    sharpe = sharpe_ratio(
+                    sharpe = additive_sharpe_ratio(
                         returns_pct / 100,
                         risk_free_rate=risk_free_annual,
-                        periods_per_year=365
+                        periods_per_year=TRADING_DAYS_PER_YEAR
                     )
                 else:
                     sharpe = 0.0
                 
                 # 计算 Maximum Drawdown
-                max_dd_pct = maximum_drawdown(returns_pct / 100) * 100
+                up_time_ids = np_time_ids[pred_up_mask] if np_time_ids is not None and len(np_time_ids) == len(np_probs) else None
+                max_dd_pct = additive_max_drawdown(returns_pct / 100, time_ids=up_time_ids, aggregate_by_time=True) * 100
                 
                 # 计算 Profit Factor (total gains / total losses)
                 gains = returns_pct[returns_pct > 0]
@@ -397,16 +493,17 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 
                 # 计算 Sharpe Ratio（统一口径：年化 Sharpe）
                 if len(returns_pct) > 1 and volatility_pct > 0:
-                    sharpe = sharpe_ratio(
+                    sharpe = additive_sharpe_ratio(
                         returns_pct / 100,
                         risk_free_rate=risk_free_annual,
-                        periods_per_year=365
+                        periods_per_year=TRADING_DAYS_PER_YEAR
                     )
                 else:
                     sharpe = 0.0
                 
                 # 计算 Maximum Drawdown
-                max_dd_pct = maximum_drawdown(returns_pct / 100) * 100
+                down_time_ids = np_time_ids[pred_down_mask] if np_time_ids is not None and len(np_time_ids) == len(np_probs) else None
+                max_dd_pct = additive_max_drawdown(returns_pct / 100, time_ids=down_time_ids, aggregate_by_time=True) * 100
                 
                 # 计算 Profit Factor
                 gains = returns_pct[returns_pct > 0]
@@ -455,15 +552,16 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                     volatility_pct = np.std(returns_pct)
 
                     if len(returns_pct) > 1 and volatility_pct > 0:
-                        sharpe = sharpe_ratio(
+                        sharpe = additive_sharpe_ratio(
                             returns_pct / 100,
                             risk_free_rate=risk_free_annual,
-                            periods_per_year=365
+                            periods_per_year=TRADING_DAYS_PER_YEAR
                         )
                     else:
                         sharpe = 0.0
 
-                    max_dd_pct = maximum_drawdown(returns_pct / 100) * 100
+                    up_major_time_ids = np_time_ids[pred_up_mask_major] if np_time_ids is not None and len(np_time_ids) == len(np_probs) else None
+                    max_dd_pct = additive_max_drawdown(returns_pct / 100, time_ids=up_major_time_ids, aggregate_by_time=True) * 100
                     gains = returns_pct[returns_pct > 0]
                     losses = returns_pct[returns_pct < 0]
                     profit_factor = np.sum(gains) / abs(np.sum(losses)) if len(losses) > 0 and np.sum(losses) != 0 else float('inf')
@@ -487,15 +585,16 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                     volatility_pct = np.std(returns_pct)
 
                     if len(returns_pct) > 1 and volatility_pct > 0:
-                        sharpe = sharpe_ratio(
+                        sharpe = additive_sharpe_ratio(
                             returns_pct / 100,
                             risk_free_rate=risk_free_annual,
-                            periods_per_year=365
+                            periods_per_year=TRADING_DAYS_PER_YEAR
                         )
                     else:
                         sharpe = 0.0
 
-                    max_dd_pct = maximum_drawdown(returns_pct / 100) * 100
+                    down_major_time_ids = np_time_ids[pred_down_mask_major] if np_time_ids is not None and len(np_time_ids) == len(np_probs) else None
+                    max_dd_pct = additive_max_drawdown(returns_pct / 100, time_ids=down_major_time_ids, aggregate_by_time=True) * 100
                     gains = returns_pct[returns_pct > 0]
                     losses = returns_pct[returns_pct < 0]
                     profit_factor = np.sum(gains) / abs(np.sum(losses)) if len(losses) > 0 and np.sum(losses) != 0 else float('inf')
@@ -545,10 +644,10 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 std_dev = np.std(decile_returns)
 
                 if len(decile_returns) > 1 and std_dev > 1e-8:
-                    sharpe = sharpe_ratio(
+                    sharpe = additive_sharpe_ratio(
                         decile_returns / 100,
                         risk_free_rate=risk_free_annual,
-                        periods_per_year=365
+                        periods_per_year=TRADING_DAYS_PER_YEAR
                     )
                 else:
                     sharpe = 0.0
@@ -622,18 +721,18 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
             
             # Sharpe ratios
             if len(long_returns) > 1:
-                long_sharpe = sharpe_ratio(
+                long_sharpe = additive_sharpe_ratio(
                     long_returns / 100,
                     risk_free_rate=risk_free_annual,
-                    periods_per_year=365
+                    periods_per_year=TRADING_DAYS_PER_YEAR
                 )  # Convert % to decimal
                 print(f"    Long Portfolio Sharpe: {long_sharpe:.4f}", flush=True)
             
             if len(short_returns) > 1:
-                short_sharpe = sharpe_ratio(
+                short_sharpe = additive_sharpe_ratio(
                     -short_returns / 100,
                     risk_free_rate=risk_free_annual,
-                    periods_per_year=365
+                    periods_per_year=TRADING_DAYS_PER_YEAR
                 )  # Short position
                 print(f"    Short Portfolio Sharpe: {short_sharpe:.4f}", flush=True)
         
@@ -657,14 +756,15 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         all_strategy_returns_valid = all_strategy_returns[valid_trade_mask]
 
         if len(all_strategy_returns_valid) > 1:
-            full_sharpe = sharpe_ratio(
+            full_sharpe = additive_sharpe_ratio(
                 all_strategy_returns_valid / 100,
                 risk_free_rate=risk_free_annual,
-                periods_per_year=365
+                periods_per_year=TRADING_DAYS_PER_YEAR
             )
-            full_ann_return = annualized_return(all_strategy_returns_valid / 100, periods_per_year=365)
-            full_ann_vol = annualized_volatility(all_strategy_returns_valid / 100, periods_per_year=365)
-            full_max_dd = maximum_drawdown(all_strategy_returns_valid / 100)
+            full_ann_return = additive_annualized_return(all_strategy_returns_valid / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+            full_ann_vol = additive_annualized_volatility(all_strategy_returns_valid / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+            full_time_ids = np_time_ids[valid_trade_mask] if np_time_ids is not None and len(np_time_ids) == len(all_strategy_returns) else None
+            full_max_dd = additive_max_drawdown(all_strategy_returns_valid / 100, time_ids=full_time_ids, aggregate_by_time=True)
             
             print(f"\n  Full Strategy Portfolio (All Predictions):", flush=True)
             print(f"    Sharpe Ratio (Annualized): {full_sharpe:.4f}", flush=True)
@@ -697,14 +797,14 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 ])
 
                 if len(daily_returns) > 1:
-                    daily_sharpe = sharpe_ratio(
+                    daily_sharpe = additive_sharpe_ratio(
                         daily_returns / 100,
                         risk_free_rate=risk_free_annual,
-                        periods_per_year=365
+                        periods_per_year=TRADING_DAYS_PER_YEAR
                     )
-                    daily_ann_return = annualized_return(daily_returns / 100, periods_per_year=365)
-                    daily_ann_vol = annualized_volatility(daily_returns / 100, periods_per_year=365)
-                    daily_max_dd = maximum_drawdown(daily_returns / 100)
+                    daily_ann_return = additive_annualized_return(daily_returns / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                    daily_ann_vol = additive_annualized_volatility(daily_returns / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                    daily_max_dd = additive_max_drawdown(daily_returns / 100, aggregate_by_time=False)
 
                     print(f"\n  Daily Aggregated Portfolio (Group by Timestamp):", flush=True)
                     print(f"    Trading Days: {len(unique_days)}", flush=True)
@@ -754,14 +854,15 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                     print(f"    Executed Trades: {len(major_exec_returns)}", flush=True)
 
                     if len(major_exec_returns) > 1:
-                        major_sharpe = sharpe_ratio(
+                        major_sharpe = additive_sharpe_ratio(
                             major_exec_returns / 100,
                             risk_free_rate=risk_free_annual,
-                            periods_per_year=365
+                            periods_per_year=TRADING_DAYS_PER_YEAR
                         )
-                        major_ann_return = annualized_return(major_exec_returns / 100, periods_per_year=365)
-                        major_ann_vol = annualized_volatility(major_exec_returns / 100, periods_per_year=365)
-                        major_max_dd = maximum_drawdown(major_exec_returns / 100)
+                        major_ann_return = additive_annualized_return(major_exec_returns / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                        major_ann_vol = additive_annualized_volatility(major_exec_returns / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                        major_time_ids = np_time_ids[major_exec_mask] if np_time_ids is not None and len(np_time_ids) == len(major_strategy_returns) else None
+                        major_max_dd = additive_max_drawdown(major_exec_returns / 100, time_ids=major_time_ids, aggregate_by_time=True)
                         major_win_rate = (np.sum(major_exec_returns > 0) / len(major_exec_returns)) * 100
 
                         print(f"    Sharpe Ratio (Annualized): {major_sharpe:.4f}", flush=True)
