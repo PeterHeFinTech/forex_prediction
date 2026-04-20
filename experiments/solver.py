@@ -822,6 +822,75 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 print(f"\n  Daily Aggregated Portfolio: timestamp not available/aligned, skipped", flush=True)
 
             # ==========================================================
+            # Confidence-Weighted Position Sizing (higher confidence -> larger position)
+            # ==========================================================
+            max_position_multiplier = 2.0
+            confidence_curve_gamma = 2.0  # >1: 更强调高置信度；=1: 线性
+
+            pred_direction_conf = np.zeros_like(actual_return_pct, dtype=float)
+            pred_direction_conf[up_pred_mask] = up_prob[up_pred_mask]
+            pred_direction_conf[down_pred_mask] = down_prob[down_pred_mask]
+
+            position_multiplier = np.zeros_like(actual_return_pct, dtype=float)
+            if np.any(executed_trade_mask):
+                conf_exec = np.clip(pred_direction_conf[executed_trade_mask], 0.0, 1.0)
+                conf_scaled = np.power(conf_exec, confidence_curve_gamma)
+                position_multiplier[executed_trade_mask] = 1.0 + (max_position_multiplier - 1.0) * conf_scaled
+
+            cw_strategy_returns = np.zeros_like(actual_return_pct, dtype=float)
+            cw_strategy_returns[executed_trade_mask] = all_strategy_returns[executed_trade_mask] * position_multiplier[executed_trade_mask]
+            cw_strategy_returns_valid = cw_strategy_returns[valid_trade_mask]
+
+            if len(cw_strategy_returns_valid) > 1:
+                cw_sharpe = additive_sharpe_ratio(
+                    cw_strategy_returns_valid / 100,
+                    risk_free_rate=risk_free_annual,
+                    periods_per_year=TRADING_DAYS_PER_YEAR
+                )
+                cw_ann_return = additive_annualized_return(cw_strategy_returns_valid / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                cw_ann_vol = additive_annualized_volatility(cw_strategy_returns_valid / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                cw_time_ids = np_time_ids[valid_trade_mask] if np_time_ids is not None and len(np_time_ids) == len(cw_strategy_returns) else None
+                cw_max_dd = additive_max_drawdown(cw_strategy_returns_valid / 100, time_ids=cw_time_ids, aggregate_by_time=True)
+                cw_exec_returns = cw_strategy_returns[executed_trade_mask]
+                cw_win_rate = (np.sum(cw_exec_returns > 0) / len(cw_exec_returns)) * 100 if len(cw_exec_returns) > 0 else 0.0
+
+                print(f"\n  Full Strategy Portfolio - Confidence Weighted (UP/DOWN only scaled):", flush=True)
+                print(
+                    f"    Position Multiplier: w(c)=1+({max_position_multiplier:.1f}-1)*c^{confidence_curve_gamma:.1f}, c in [0,1]",
+                    flush=True,
+                )
+                print(f"    Sharpe Ratio (Annualized): {cw_sharpe:.4f}", flush=True)
+                print(f"    Annualized Return: {cw_ann_return*100:.2f}%", flush=True)
+                print(f"    Annualized Volatility: {cw_ann_vol*100:.2f}%", flush=True)
+                print(f"    Maximum Drawdown: {cw_max_dd*100:.2f}%", flush=True)
+                print(f"    Total Cumulative Return: {np.sum(cw_strategy_returns_valid):.2f}%", flush=True)
+                print(f"    Mean Return per Trade: {np.mean(cw_exec_returns):.4f}%", flush=True)
+                print(f"    Win Rate (Executed Trades Only): {cw_win_rate:.2f}%", flush=True)
+
+                if np_time_ids is not None and len(np_time_ids) == len(all_pred_classes):
+                    cw_aligned_time_ids = np_time_ids[valid_trade_mask]
+                    cw_daily_unique = np.unique(cw_aligned_time_ids)
+                    cw_daily_returns = np.array([
+                        np.mean(cw_strategy_returns_valid[cw_aligned_time_ids == d])
+                        for d in cw_daily_unique
+                    ])
+
+                    if len(cw_daily_returns) > 1:
+                        cw_daily_sharpe = additive_sharpe_ratio(
+                            cw_daily_returns / 100,
+                            risk_free_rate=risk_free_annual,
+                            periods_per_year=TRADING_DAYS_PER_YEAR
+                        )
+                        cw_daily_ann_return = additive_annualized_return(cw_daily_returns / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                        cw_daily_ann_vol = additive_annualized_volatility(cw_daily_returns / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                        cw_daily_max_dd = additive_max_drawdown(cw_daily_returns / 100, aggregate_by_time=False)
+
+                        print(f"    Daily Sharpe Ratio (Annualized): {cw_daily_sharpe:.4f}", flush=True)
+                        print(f"    Daily Annualized Return: {cw_daily_ann_return*100:.2f}%", flush=True)
+                        print(f"    Daily Annualized Volatility: {cw_daily_ann_vol*100:.2f}%", flush=True)
+                        print(f"    Daily Maximum Drawdown: {cw_daily_max_dd*100:.2f}%", flush=True)
+
+            # ==========================================================
             # Major Currency Pairs Only (0.5 pip spread, trade UP/DOWN only)
             # ==========================================================
             if np_pair_names_norm is not None and len(np_pair_names_norm) == len(all_pred_classes):
@@ -872,6 +941,40 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                         print(f"    Total Cumulative Return: {np.sum(major_exec_returns):.2f}%", flush=True)
                         print(f"    Mean Return per Trade: {np.mean(major_exec_returns):.4f}%", flush=True)
                         print(f"    Win Rate (Executed Trades Only): {major_win_rate:.2f}%", flush=True)
+
+                        major_pred_conf = np.zeros_like(actual_return_pct, dtype=float)
+                        major_pred_conf[major_up_trade_mask] = up_prob[major_up_trade_mask]
+                        major_pred_conf[major_down_trade_mask] = down_prob[major_down_trade_mask]
+
+                        major_position_multiplier = np.zeros_like(actual_return_pct, dtype=float)
+                        major_conf_exec = np.clip(major_pred_conf[major_exec_mask], 0.0, 1.0)
+                        major_conf_scaled = np.power(major_conf_exec, confidence_curve_gamma)
+                        major_position_multiplier[major_exec_mask] = 1.0 + (max_position_multiplier - 1.0) * major_conf_scaled
+
+                        major_cw_returns = major_exec_returns * major_position_multiplier[major_exec_mask]
+                        major_cw_sharpe = additive_sharpe_ratio(
+                            major_cw_returns / 100,
+                            risk_free_rate=risk_free_annual,
+                            periods_per_year=TRADING_DAYS_PER_YEAR
+                        )
+                        major_cw_ann_return = additive_annualized_return(major_cw_returns / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                        major_cw_ann_vol = additive_annualized_volatility(major_cw_returns / 100, periods_per_year=TRADING_DAYS_PER_YEAR)
+                        major_cw_time_ids = np_time_ids[major_exec_mask] if np_time_ids is not None and len(np_time_ids) == len(major_strategy_returns) else None
+                        major_cw_max_dd = additive_max_drawdown(major_cw_returns / 100, time_ids=major_cw_time_ids, aggregate_by_time=True)
+                        major_cw_win_rate = (np.sum(major_cw_returns > 0) / len(major_cw_returns)) * 100
+
+                        print(f"\n    Major Pairs - Confidence Weighted:", flush=True)
+                        print(
+                            f"      Position Multiplier: w(c)=1+({max_position_multiplier:.1f}-1)*c^{confidence_curve_gamma:.1f}, c in [0,1]",
+                            flush=True,
+                        )
+                        print(f"      Sharpe Ratio (Annualized): {major_cw_sharpe:.4f}", flush=True)
+                        print(f"      Annualized Return: {major_cw_ann_return*100:.2f}%", flush=True)
+                        print(f"      Annualized Volatility: {major_cw_ann_vol*100:.2f}%", flush=True)
+                        print(f"      Maximum Drawdown: {major_cw_max_dd*100:.2f}%", flush=True)
+                        print(f"      Total Cumulative Return: {np.sum(major_cw_returns):.2f}%", flush=True)
+                        print(f"      Mean Return per Trade: {np.mean(major_cw_returns):.4f}%", flush=True)
+                        print(f"      Win Rate (Executed Trades Only): {major_cw_win_rate:.2f}%", flush=True)
                     else:
                         print(f"    Insufficient executed major-pair trades for metric calculation", flush=True)
                 else:
