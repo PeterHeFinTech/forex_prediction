@@ -18,6 +18,15 @@ from utils.metrics import (
 
 TRADING_DAYS_PER_YEAR = 261
 
+MAJOR_PAIRS_NORM = {
+    'EURUSD', 'USDJPY', 'GBPUSD', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
+    'JPYUSD', 'CHFUSD', 'CADUSD', 'USDEUR', 'USDGBP', 'USDAUD', 'USDNZD'
+}
+
+
+def normalize_pair_name(name):
+    return str(name).upper().replace('/', '')
+
 
 def additive_max_drawdown(returns, time_ids=None, aggregate_by_time=True):
     """
@@ -238,6 +247,8 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
     all_day128_close = []  # 第128天收盘价 (输入序列最后一天)
     all_day129_close = []  # 第129天收盘价 (目标日)
     all_pair_names = []
+    major_loss_total = 0.0
+    major_loss_samples = 0
 
     if rank == 0:
         print(f"\n[{dataset_name}] Starting evaluation, total batches: {len(val_loader)}", flush=True)
@@ -275,6 +286,21 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 loss = criterion(outputs, labels)
 
             total_loss += loss.item() * batch_size
+
+            if pair_names is not None:
+                if isinstance(pair_names, (list, tuple)):
+                    batch_pair_names = [str(x) for x in pair_names]
+                else:
+                    batch_pair_names = [str(x) for x in pair_names.cpu().tolist()]
+
+                batch_pair_names_norm = np.array([normalize_pair_name(x) for x in batch_pair_names], dtype=object)
+                major_mask = np.isin(batch_pair_names_norm, list(MAJOR_PAIRS_NORM))
+                if np.any(major_mask):
+                    major_mask_t = torch.as_tensor(major_mask, device=labels.device, dtype=torch.bool)
+                    major_loss = criterion(outputs[major_mask_t], labels[major_mask_t])
+                    major_count = int(major_mask_t.sum().item())
+                    major_loss_total += major_loss.item() * major_count
+                    major_loss_samples += major_count
             
             # 计算标准准确率 (Argmax, 默认阈值逻辑)
             # 获取概率分布
@@ -318,6 +344,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
     f1_weighted = 0.0
     precision_macro = 0.0
     recall_macro = 0.0
+    major_loss_avg = 0.0
     
     if rank == 0:
         # 将收集到的数据转为 Numpy 数组方便计算
@@ -330,6 +357,11 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         np_pair_names_norm = None
         if np_pair_names is not None:
             np_pair_names_norm = np.char.replace(np.char.upper(np_pair_names.astype(str)), '/', '')
+
+        if major_loss_samples > 0:
+            major_loss_avg = major_loss_total / major_loss_samples
+        else:
+            major_loss_avg = loss_avg
         
         # 原始的基础预测 (Argmax)
         np_preds = np.argmax(np_probs, axis=1)
@@ -347,6 +379,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         print(f"  Accuracy: {acc_avg:.2f}%", flush=True)
         print(f"  F1 (Macro): {f1_macro:.2f}% | F1 (Weighted): {f1_weighted:.2f}%", flush=True)
         print(f"  F1 per class - Down: {f1_per_class[0]:.2f}%, Stable: {f1_per_class[1]:.2f}%, Up: {f1_per_class[2]:.2f}%", flush=True)
+        print(f"  Major-Pair Focal Loss: {major_loss_avg:.6f}", flush=True)
         
         print(f"\n  Confusion Matrix:", flush=True)
         print(f"              Pred Down  Pred Stable  Pred Up", flush=True)
@@ -985,10 +1018,10 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         print(f"{'-'*80}")
 
     # 广播基础指标到所有进程 (保持流程完整性)
-    metrics_tensor = torch.tensor([loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted], device=device)
+    metrics_tensor = torch.tensor([loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted, major_loss_avg], device=device)
     dist.broadcast(metrics_tensor, src=0)
     
     # 解包
-    loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted = metrics_tensor.tolist()
+    loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted, major_loss_avg = metrics_tensor.tolist()
     
-    return loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted
+    return loss_avg, acc_avg, precision_macro, recall_macro, f1_macro, f1_weighted, major_loss_avg

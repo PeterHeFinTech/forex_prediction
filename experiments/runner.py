@@ -29,7 +29,7 @@ class FocalLoss(nn.Module):
         return focal_loss.mean()
 
 
-def save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1):
+def save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1, val_major_loss):
     os.makedirs("checkpoints", exist_ok=True)
     checkpoint = {
         'epoch': epoch + 1,
@@ -37,7 +37,8 @@ def save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1):
         'optimizer_state_dict': optimizer.state_dict(),
         'val_loss': val_loss,
         'val_acc': val_acc,
-        'val_f1': val_f1
+        'val_f1': val_f1,
+        'val_major_loss': val_major_loss,
     }
     torch.save(checkpoint, "checkpoints/best_model.pt")
 
@@ -55,7 +56,7 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
 
         
         # data_path = "./fin_hloc/forex_atr_by_time.npz"
-        data_path = "/home/corelabtq/Desktop/Research/forex/fin_factor/data.npz"
+        data_path = "/home/corelabtq/Desktop/Research/forex/fin_factor/major.npz"
 
         train_dataset, val_dataset, train_size, val_size = create_dataset(
             data_path=data_path, 
@@ -136,7 +137,7 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
 
             # ============ 验证 ============
             start_val = time.time()
-            val_loss, val_acc, val_precision, val_recall, val_f1_macro, val_f1_weighted = evaluator(
+            val_loss, val_acc, val_precision, val_recall, val_f1_macro, val_f1_weighted, val_major_loss = evaluator(
                 model, val_loader, criterion, device, use_amp, rank, dataset_name="Validation"
             )
             val_time = time.time() - start_val
@@ -152,7 +153,7 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
             
             if test_loader is not None:
                 start_test = time.time()
-                test_loss, test_acc, test_precision, test_recall, test_f1_macro, test_f1_weighted = evaluator(
+                test_loss, test_acc, test_precision, test_recall, test_f1_macro, test_f1_weighted, test_major_loss = evaluator(
                     model, test_loader, criterion, device, use_amp, rank, dataset_name="Test"
                 )
                 test_time = time.time() - start_test
@@ -170,6 +171,7 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
                       f"{train_recall:>7.2f}% {train_f1_macro:>7.2f}% {train_time:>7.1f}s", flush=True)
                 print(f"{'Validation':<12} {val_loss:>10.6f} {val_acc:>7.2f}% {val_precision:>7.2f}% "
                       f"{val_recall:>7.2f}% {val_f1_macro:>7.2f}% {val_time:>7.1f}s", flush=True)
+                print(f"{'Val MajorLoss':<12} {val_major_loss:>10.6f}", flush=True)
                 if test_loader is not None:
                     print(f"{'Test':<12} {test_loss:>10.6f} {test_acc:>7.2f}% {test_precision:>7.2f}% "
                           f"{test_recall:>7.2f}% {test_f1_macro:>7.2f}% {test_time:>7.1f}s", flush=True)
@@ -178,20 +180,21 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
                 print(f"{'='*100}\n", flush=True)
 
                 # 保存最佳模型
-                if val_f1_macro > best_val_f1:
+                if val_major_loss < best_val_loss:
                     best_val_f1 = val_f1_macro
-                    best_val_loss = val_loss
-                    save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1_macro)
-                    print(f"✓ New best model saved! Val F1: {best_val_f1:.2f}%, Val Loss: {best_val_loss:.6f}\n", flush=True)
+                    best_val_loss = val_major_loss
+                    save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1_macro, val_major_loss)
+                    print(f"✓ New best model saved! Val Major Loss: {best_val_loss:.6f}, Val F1: {best_val_f1:.2f}%\n", flush=True)
                     no_improve_epochs = 0
                 else:
                     no_improve_epochs += 1
-                    print(f"No improvement for {no_improve_epochs} epochs (Best Val F1: {best_val_f1:.2f}%)\n", flush=True)
+                    print(f"No improvement for {no_improve_epochs} epochs (Best Val Major Loss: {best_val_loss:.6f})\n", flush=True)
+                print(f"Best validation Major Loss: {best_val_loss:.6f}", flush=True)
 
                 # Early stopping
                 if no_improve_epochs >= patience:
                     print(f"Early stopping triggered at epoch {epoch+1}", flush=True)
-                    print(f"Best validation F1: {best_val_f1:.2f}%\n", flush=True)
+                    print(f"Best validation Major Loss: {best_val_loss:.6f}\n", flush=True)
                     early_stop_flag[0] = 1 
 
             dist.broadcast(early_stop_flag, src=0)
@@ -207,7 +210,7 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
             print(f"TRAINING COMPLETED", flush=True)
             print(f"{'='*100}", flush=True)
             print(f"Best Validation F1: {best_val_f1:.2f}%", flush=True)
-            print(f"Best Validation Loss: {best_val_loss:.6f}", flush=True)
+            print(f"Best Validation Major Loss: {best_val_loss:.6f}", flush=True)
             print(f"{'='*100}\n", flush=True)
 
     except Exception as e:
