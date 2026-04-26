@@ -448,7 +448,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
                 np_pair_names_norm = np_pair_names_norm[valid_return_mask]
 
         # 2 pip spread成本 (约0.02%)
-        spread_cost_pct = 0.02
+        spread_cost_pct = 0.005
 
         # 无风险利率: 年化 2%
         risk_free_annual = 0.02
