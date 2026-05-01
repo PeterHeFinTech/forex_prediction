@@ -389,6 +389,7 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
 
         # 过滤极小价格样本，避免收益率分母过小导致异常超大百分比
         min_valid_price = 1e-4
+        # 使用目标日开盘价作为收益分母，过滤过小的开盘价样本
         valid_price_mask = (np_day128_close >= min_valid_price)
         removed_count = int(np.sum(~valid_price_mask))
         kept_count = int(np.sum(valid_price_mask))
@@ -422,9 +423,8 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
 
         thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
 
-        # 计算真实百分比收益: day 129 vs day 128
-        # actual_return_pct = (price_129 - price_128) / price_128 * 100
-        actual_return_pct = (np_day129_close - np_day128_close) / np_day128_close * 100
+        # 计算真实百分比收益: (day129_close - day128_close) / day128_close * 100
+        actual_return_pct = (np_day129_close - np_day128_close) / (np_day128_close + 1e-12) * 100
 
         # 过滤异常超大收益（通常由极小分母或坏点导致），避免统计量失真与 inf/nan
         max_abs_return_pct = 200.0
@@ -649,9 +649,9 @@ def evaluator(model, val_loader, criterion, device, use_amp, rank=0, dataset_nam
         up_prob = np_probs[:, 2]
         down_prob = np_probs[:, 0]
 
-        # UP侧: LONG收益（扣spread）
+        # UP侧: LONG收益（扣spread） - 使用当日开盘作为入场价
         up_side_returns = (np_day129_close - np_day128_close) / (np_day128_close + 1e-8) * 100 - spread_cost_pct
-        # DOWN侧: SHORT收益（扣spread）
+        # DOWN侧: SHORT收益（扣spread） - 使用day128收盘作为入场参考
         down_side_returns = -(np_day129_close - np_day128_close) / (np_day128_close + 1e-8) * 100 - spread_cost_pct
 
         def run_decile_table(score, returns, title):

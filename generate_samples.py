@@ -281,10 +281,8 @@ def create_qualified_forex_samples(
             target_value = pair_data[:4, target_day]
             _ = prev_day
 
-            # 过滤异常低价样本：最后一个输入时点(index=128)或目标时点(index=129)
-            # 任一 OHLC 数值小于阈值时，直接跳过该样本
-            last_input_value = window_data[:4, -1]
-            if np.any(last_input_value < min_price_threshold) or np.any(target_value < min_price_threshold):
+            # 过滤异常低价样本：如果样本窗口内任意值或目标 OHLC 中存在小于阈值的值，跳过该样本
+            if np.any(window_data < min_price_threshold) or np.any(target_value < min_price_threshold):
                 continue
 
             # MACD 通道为第 5 个通道（索引4），若开头若干步出现 0 则剔除该样本
@@ -320,7 +318,10 @@ def create_qualified_forex_samples(
         print(f"样本数量: {samples_array.shape[0]}")
         print(f"样本形状: {samples_array.shape}")
         print(f"样本对应货币对数量: {len(set(sample_pair_info))}")
-        print(f"样本时间范围: {sample_times_array[0]} -> {sample_times_array[-1]}")
+        if samples_array.shape[0] > 0 and sample_times_array.size > 0:
+            print(f"样本时间范围: {sample_times_array[0]} -> {sample_times_array[-1]}")
+        else:
+            print("样本时间范围: N/A (no qualified samples)")
 
     return (
         samples_array,
@@ -507,15 +508,19 @@ from sklearn.model_selection import train_test_split
 # ==================== 工具函数 ====================
 def create_atr_labels(samples: np.ndarray, 
                      targets: np.ndarray,
+                     sample_times: np.ndarray = None,
                      atr_multiplier: float = 0.5,
                      atr_period: int = 128,
-                     verbose: bool = True) -> np.ndarray:
+                     verbose: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """
     基于ATR生成标签 (0:大跌, 1:平盘, 2:大涨)
     只返回标签，不保留具体价格
+    过滤掉day128（窗口最后一天）是星期五的样本
+    返回: (labels, valid_mask) - valid_mask 指示哪些样本通过了过滤
     """
     num_samples = samples.shape[0]
     labels = np.zeros(num_samples, dtype=np.int32)
+    valid_mask = np.ones(num_samples, dtype=bool)
     
     # 特征索引 - OHLC
     HIGH_IDX = 1
@@ -524,21 +529,34 @@ def create_atr_labels(samples: np.ndarray,
     
     # 统计
     label_counts = {0: 0, 1: 0, 2: 0}
+    friday_filtered = 0
     
     for i in range(num_samples):
         sample = samples[i]  # (特征数, window_size)
+        
+        # 检查day128（窗口最后一天）是否为星期五
+        if sample_times is not None and i < len(sample_times):
+            try:
+                import pandas as pd
+                day128_timestamp = pd.Timestamp(sample_times[i])
+                if day128_timestamp.weekday() == 4:  # 4 = Friday
+                    valid_mask[i] = False
+                    friday_filtered += 1
+                    continue
+            except:
+                pass
         
         # 提取数据
         high_series = sample[HIGH_IDX]
         low_series = sample[LOW_IDX]
         close_series = sample[CLOSE_IDX]
         
-        # 计算收益率
-        last_close = close_series[-1]
-        target_close = targets[i, CLOSE_IDX]
-        
-        if last_close > 0:
-            return_rate = (target_close - last_close) / last_close
+        # 计算收益率：使用day128收盘价作为入场价，day129收盘价作为退出价 (close-to-close)
+        day128_close = close_series[-1]
+        day129_close = targets[i, CLOSE_IDX]
+
+        if day128_close > 0:
+            return_rate = (day129_close - day128_close) / day128_close
         else:
             return_rate = 0.0
         
@@ -559,9 +577,9 @@ def create_atr_labels(samples: np.ndarray,
         else:
             atr = np.mean(tr)
         
-        # 计算阈值
-        if last_close > 0:
-            threshold = (atr_multiplier * atr) / last_close
+        # 计算阈值（用day128收盘价归一化，与 return_rate 口径一致）
+        if day128_close > 0:
+            threshold = (atr_multiplier * atr) / day128_close
         else:
             threshold = 0
         
@@ -577,40 +595,61 @@ def create_atr_labels(samples: np.ndarray,
             label_counts[1] += 1
     
     if verbose:
+        kept_count = np.sum(valid_mask)
         print(f"ATR标签生成:")
-        print(f"  样本数: {num_samples:,}")
-        print(f"  标签分布: 大跌({label_counts[0]}) 平盘({label_counts[1]}) 大涨({label_counts[2]})")
-        print(f"  比例: 大跌({label_counts[0]/num_samples:.1%}) 平盘({label_counts[1]/num_samples:.1%}) 大涨({label_counts[2]/num_samples:.1%})")
+        print(f"  原始样本数: {num_samples:,}")
+        print(f"  星期五过滤: 移除 {friday_filtered} 个样本 ({friday_filtered/num_samples*100:.2f}%)")
+        print(f"  保留样本数: {int(kept_count):,}")
+        if kept_count > 0:
+            print(f"  标签分布: 大跌({label_counts[0]}) 平盘({label_counts[1]}) 大涨({label_counts[2]})")
+            print(f"  比例: 大跌({label_counts[0]/kept_count:.1%}) 平盘({label_counts[1]/kept_count:.1%}) 大涨({label_counts[2]/kept_count:.1%})")
     
-    return labels
+    return labels, valid_mask
 
 def create_std_labels(samples: np.ndarray,
                      targets: np.ndarray,
+                     sample_times: np.ndarray = None,
                      std_multiplier: float = 0.5,
                      std_period: int = 128,
-                     verbose: bool = True) -> np.ndarray:
+                     verbose: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """
     基于标准差生成标签 (0:大跌, 1:平盘, 2:大涨)
+    过滤掉day128（窗口最后一天）是星期五的样本
+    返回: (labels, valid_mask) - valid_mask 指示哪些样本通过了过滤
     """
     num_samples = samples.shape[0]
     labels = np.zeros(num_samples, dtype=np.int32)
+    valid_mask = np.ones(num_samples, dtype=bool)
     
     # 特征索引
     CLOSE_IDX = 3
     
     # 统计
     label_counts = {0: 0, 1: 0, 2: 0}
+    friday_filtered = 0
     
     for i in range(num_samples):
         sample = samples[i]
         close_series = sample[CLOSE_IDX]
         
-        # 计算收益率
-        last_close = close_series[-1]
-        target_close = targets[i, CLOSE_IDX]
+        # 检查day128（窗口最后一天）是否为星期五
+        if sample_times is not None and i < len(sample_times):
+            try:
+                import pandas as pd
+                day128_timestamp = pd.Timestamp(sample_times[i])
+                if day128_timestamp.weekday() == 4:  # 4 = Friday
+                    valid_mask[i] = False
+                    friday_filtered += 1
+                    continue
+            except:
+                pass
         
-        if last_close > 0:
-            return_rate = (target_close - last_close) / last_close
+        # 计算收益率：使用day128收盘价作为入场价，day129收盘价作为退出价 (close-to-close)
+        day128_close = close_series[-1]
+        day129_close = targets[i, CLOSE_IDX]
+
+        if day128_close > 0:
+            return_rate = (day129_close - day128_close) / day128_close
         else:
             return_rate = 0.0
         
@@ -642,19 +681,35 @@ def create_std_labels(samples: np.ndarray,
             label_counts[1] += 1
     
     if verbose:
+        kept_count = np.sum(valid_mask)
         print(f"标准差标签生成:")
-        print(f"  样本数: {num_samples:,}")
-        print(f"  标签分布: 大跌({label_counts[0]}) 平盘({label_counts[1]}) 大涨({label_counts[2]})")
-        print(f"  比例: 大跌({label_counts[0]/num_samples:.1%}) 平盘({label_counts[1]/num_samples:.1%}) 大涨({label_counts[2]/num_samples:.1%})")
+        print(f"  原始样本数: {num_samples:,}")
+        print(f"  星期五过滤: 移除 {friday_filtered} 个样本 ({friday_filtered/num_samples*100:.2f}%)")
+        print(f"  保留样本数: {int(kept_count):,}")
+        if kept_count > 0:
+            print(f"  标签分布: 大跌({label_counts[0]}) 平盘({label_counts[1]}) 大涨({label_counts[2]})")
+            print(f"  比例: 大跌({label_counts[0]/kept_count:.1%}) 平盘({label_counts[1]/kept_count:.1%}) 大涨({label_counts[2]/kept_count:.1%})")
     
-    return labels
+    return labels, valid_mask
 
 # ===== Cell 15 =====
 # 假设你已经有：
 # samples, targets, pair_indices, pair_names, start_indices, target_indices
 
 print("生成 ATR 标签...")
-atr_labels = create_atr_labels(samples, targets, atr_multiplier=0.5, atr_period=128, verbose=True)
+atr_labels, atr_valid_mask = create_atr_labels(samples, targets, sample_times=sample_times, atr_multiplier=0.5, atr_period=128, verbose=True)
+
+# 应用过滤mask：保留valid的样本
+samples = samples[atr_valid_mask]
+targets = targets[atr_valid_mask]
+pair_indices = pair_indices[atr_valid_mask]
+pair_names = pair_names[atr_valid_mask]
+start_indices = start_indices[atr_valid_mask]
+target_indices = target_indices[atr_valid_mask]
+sample_times = sample_times[atr_valid_mask]
+atr_labels = atr_labels[atr_valid_mask]
+
+print(f"样本过滤完成，剩余 {len(samples):,} 个样本")
 
 # print("\n生成标准差标签...")
 # std_labels = create_std_labels(samples, targets, std_multiplier=0.5, std_period=128, verbose=True)

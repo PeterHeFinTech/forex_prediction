@@ -40,7 +40,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1, val_majo
         'val_f1': val_f1,
         'val_major_loss': val_major_loss,
     }
-    torch.save(checkpoint, "checkpoints/best_model.pt")
+    torch.save(checkpoint, "checkpoints/R1.pt")
 
 
 def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers,
@@ -56,7 +56,7 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
 
         
         # data_path = "./fin_hloc/forex_atr_by_time.npz"
-        data_path = "/home/corelabtq/Desktop/Research/forex/fin_factor/major.npz"
+        data_path = "/home/corelabtq/Desktop/Research/forex/fin_factor/forex_atr_by_time.npz"
 
         train_dataset, val_dataset, train_size, val_size = create_dataset(
             data_path=data_path, 
