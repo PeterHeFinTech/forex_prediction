@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,8 +30,10 @@ class FocalLoss(nn.Module):
         return focal_loss.mean()
 
 
-def save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1, val_major_loss):
-    os.makedirs("checkpoints", exist_ok=True)
+def save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1,
+                    checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         'epoch': epoch + 1,
         'model_state_dict': model.module.state_dict(),
@@ -38,13 +41,15 @@ def save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1, val_majo
         'val_loss': val_loss,
         'val_acc': val_acc,
         'val_f1': val_f1,
-        'val_major_loss': val_major_loss,
+        'selection_metric': 'validation_loss',
     }
-    torch.save(checkpoint, "checkpoints/R1.pt")
+    torch.save(checkpoint, checkpoint_path)
 
 
 def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers,
-            num_epochs, learning_rate, patience, use_amp, master_addr, master_port, seed, data_fraction=1.0):
+            num_epochs, learning_rate, patience, use_amp, master_addr,
+            master_port, seed, data_fraction=1.0, data_path=None,
+            checkpoint_path="checkpoints/best_model.pt"):
     try:
         torch.backends.cudnn.benchmark = True
         set_local_seed(seed + rank)
@@ -55,9 +60,6 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
         device = torch.device(f"cuda:{rank}")
 
         
-        # data_path = "./fin_hloc/forex_atr_by_time.npz"
-        data_path = "/home/corelabtq/Desktop/Research/forex/fin_factor/forex_atr_by_time.npz"
-
         train_dataset, val_dataset, train_size, val_size = create_dataset(
             data_path=data_path, 
             dtype=torch.float32, 
@@ -137,8 +139,9 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
 
             # ============ 验证 ============
             start_val = time.time()
-            val_loss, val_acc, val_precision, val_recall, val_f1_macro, val_f1_weighted, val_major_loss = evaluator(
-                model, val_loader, criterion, device, use_amp, rank, dataset_name="Validation"
+            val_loss, val_acc, val_precision, val_recall, val_f1_macro, val_f1_weighted, _ = evaluator(
+                model, val_loader, criterion, device, use_amp, rank,
+                dataset_name="Validation"
             )
             val_time = time.time() - start_val
 
@@ -153,8 +156,9 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
             
             if test_loader is not None:
                 start_test = time.time()
-                test_loss, test_acc, test_precision, test_recall, test_f1_macro, test_f1_weighted, test_major_loss = evaluator(
-                    model, test_loader, criterion, device, use_amp, rank, dataset_name="Test"
+                test_loss, test_acc, test_precision, test_recall, test_f1_macro, test_f1_weighted, _ = evaluator(
+                    model, test_loader, criterion, device, use_amp, rank,
+                    dataset_name="Test"
                 )
                 test_time = time.time() - start_test
 
@@ -171,7 +175,6 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
                       f"{train_recall:>7.2f}% {train_f1_macro:>7.2f}% {train_time:>7.1f}s", flush=True)
                 print(f"{'Validation':<12} {val_loss:>10.6f} {val_acc:>7.2f}% {val_precision:>7.2f}% "
                       f"{val_recall:>7.2f}% {val_f1_macro:>7.2f}% {val_time:>7.1f}s", flush=True)
-                print(f"{'Val MajorLoss':<12} {val_major_loss:>10.6f}", flush=True)
                 if test_loader is not None:
                     print(f"{'Test':<12} {test_loss:>10.6f} {test_acc:>7.2f}% {test_precision:>7.2f}% "
                           f"{test_recall:>7.2f}% {test_f1_macro:>7.2f}% {test_time:>7.1f}s", flush=True)
@@ -180,21 +183,22 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
                 print(f"{'='*100}\n", flush=True)
 
                 # 保存最佳模型
-                if val_major_loss < best_val_loss:
+                if val_loss < best_val_loss:
                     best_val_f1 = val_f1_macro
-                    best_val_loss = val_major_loss
-                    save_checkpoint(model, optimizer, epoch, val_loss, val_acc, val_f1_macro, val_major_loss)
-                    print(f"✓ New best model saved! Val Major Loss: {best_val_loss:.6f}, Val F1: {best_val_f1:.2f}%\n", flush=True)
+                    best_val_loss = val_loss
+                    save_checkpoint(model, optimizer, epoch, val_loss, val_acc,
+                                    val_f1_macro, checkpoint_path)
+                    print(f"✓ New best model saved! Val Loss: {best_val_loss:.6f}, Val F1: {best_val_f1:.2f}%\n", flush=True)
                     no_improve_epochs = 0
                 else:
                     no_improve_epochs += 1
-                    print(f"No improvement for {no_improve_epochs} epochs (Best Val Major Loss: {best_val_loss:.6f})\n", flush=True)
-                print(f"Best validation Major Loss: {best_val_loss:.6f}", flush=True)
+                    print(f"No improvement for {no_improve_epochs} epochs (Best Val Loss: {best_val_loss:.6f})\n", flush=True)
+                print(f"Best validation Loss: {best_val_loss:.6f}", flush=True)
 
                 # Early stopping
                 if no_improve_epochs >= patience:
                     print(f"Early stopping triggered at epoch {epoch+1}", flush=True)
-                    print(f"Best validation Major Loss: {best_val_loss:.6f}\n", flush=True)
+                    print(f"Best validation Loss: {best_val_loss:.6f}\n", flush=True)
                     early_stop_flag[0] = 1 
 
             dist.broadcast(early_stop_flag, src=0)
@@ -210,7 +214,7 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
             print(f"TRAINING COMPLETED", flush=True)
             print(f"{'='*100}", flush=True)
             print(f"Best Validation F1: {best_val_f1:.2f}%", flush=True)
-            print(f"Best Validation Major Loss: {best_val_loss:.6f}", flush=True)
+            print(f"Best Validation Loss: {best_val_loss:.6f}", flush=True)
             print(f"{'='*100}\n", flush=True)
 
     except Exception as e:
@@ -224,13 +228,16 @@ def exp_rnn(rank, world_size, model_class, model_config, batch_size, num_workers
 
 
 def exp_ddp(world_size, model_class, model_config, batch_size, num_workers,
-            num_epochs, learning_rate, patience, use_amp, master_addr, master_port, seed, data_fraction=1.0):
+            num_epochs, learning_rate, patience, use_amp, master_addr,
+            master_port, seed, data_fraction=1.0, data_path=None,
+            checkpoint_path="checkpoints/best_model.pt"):
     processes = []
     for rank in range(world_size):
         p = Process(target=exp_rnn, args=(
             rank, world_size, model_class, model_config, batch_size,
             num_workers, num_epochs, learning_rate, patience,
-            use_amp, master_addr, master_port, seed, data_fraction
+            use_amp, master_addr, master_port, seed, data_fraction,
+            data_path, checkpoint_path
         ))
         p.start()
         processes.append(p)

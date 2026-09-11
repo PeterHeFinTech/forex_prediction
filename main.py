@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -35,12 +36,24 @@ def parse_args():
     parser.add_argument('--use_amp', action='store_true') 
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--data_fraction', type=float, default=1.0, help='Fraction of train/validation/test data to use (0.0-1.0, e.g., 1/30 ≈ 0.0333)')
+    parser.add_argument(
+        '--data_path',
+        type=Path,
+        default=Path('/home/corelabtq/Desktop/Research/stock_atr_by_time.npz'),
+        help='Path to the train/validation/test NPZ dataset',
+    )
+    parser.add_argument(
+        '--checkpoint_path',
+        type=Path,
+        default=Path('checkpoints/best_model.pt'),
+        help='Path used to save the best model checkpoint',
+    )
     
     # Model parameters - 修改为新模型的参数
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension size')
     parser.add_argument('--num_layers', type=int, default=3, help='Number of transformer layers')
     parser.add_argument('--seq_size', type=int, default=96, help='Sequence length (should match data)')
-    parser.add_argument('--num_features', type=int, default=10, help='Number of input features (already includes factors)')
+    parser.add_argument('--num_features', type=int, default=12, help='Number of stock input features')
     parser.add_argument('--num_heads', type=int, default=16, help='Number of attention heads')
     parser.add_argument('--num_classes', type=int, default=3, help='Number of output classes')
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
@@ -82,5 +95,7 @@ if __name__ == "__main__":
         master_addr=args.master_addr,
         master_port=args.master_port,
         seed=args.seed,
-        data_fraction=args.data_fraction
+        data_fraction=args.data_fraction,
+        data_path=str(args.data_path.expanduser().resolve()),
+        checkpoint_path=str(args.checkpoint_path.expanduser().resolve()),
     )

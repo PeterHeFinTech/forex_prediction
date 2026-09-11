@@ -15,10 +15,13 @@ slurm-*.out
 
 # Training artifacts
 checkpoints/
+probing/
+results/
+fin_factor/
+fin_hloc/
+logs/
 
 # Large datasets (keep structure, skip raw binaries)
-fin_factor/*.npz
-fin_hloc/*.npz
 *.pt
 *.npy
 

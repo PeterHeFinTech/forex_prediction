@@ -177,10 +177,11 @@ def report_memory(prefix=""):
     print(f"{prefix}Current RAM usage: {mem:.2f} GB", flush=True)
 
 class ForexClassificationDataset(torch.utils.data.Dataset):
-    def __init__(self, inputs, labels, targets, time_ids, indices, pair_names=None):
+    def __init__(self, inputs, labels, targets, target_returns, time_ids, indices, pair_names=None):
         self.x = inputs
         self.y = labels
         self.targets = targets  # 第129天的OHLC价格
+        self.target_returns = target_returns  # corporate-action-safe close/pre_close - 1
         self.time_ids = time_ids  # 每个样本所属时间桶（用于按天聚合评估）
         self.indices = indices
         self.pair_names = pair_names
@@ -193,15 +194,16 @@ class ForexClassificationDataset(torch.utils.data.Dataset):
         # 这样即使数据被多次采样，也不需要复制物理内存中的 Tensor
         i = self.indices[idx]
         if self.pair_names is not None:
-            return self.x[i], self.y[i], self.targets[i], self.time_ids[i], self.pair_names[i]
-        return self.x[i], self.y[i], self.targets[i], self.time_ids[i]
+            return self.x[i], self.y[i], self.targets[i], self.time_ids[i], self.pair_names[i], self.target_returns[i]
+        return self.x[i], self.y[i], self.targets[i], self.time_ids[i], self.target_returns[i]
 
-def sample_tensor_quintuplet(inputs, labels, targets, time_ids, pair_names, fraction):
+def sample_tensor_quintuplet(inputs, labels, targets, target_returns, time_ids, pair_names, fraction):
     total_size = inputs.shape[0]
     sample_size = max(1, int(total_size * fraction))
     sample_indices = np.random.choice(total_size, size=sample_size, replace=False)
     pair_sampled = pair_names[sample_indices] if pair_names is not None else None
-    return inputs[sample_indices], labels[sample_indices], targets[sample_indices], time_ids[sample_indices], pair_sampled, sample_size
+    return (inputs[sample_indices], labels[sample_indices], targets[sample_indices],
+            target_returns[sample_indices], time_ids[sample_indices], pair_sampled, sample_size)
 
 
 def _to_time_ids(arr):
@@ -293,10 +295,14 @@ def create_dataset(data_path, dtype, rank, balance_train=True, data_fraction=1.0
     train_inputs = torch.from_numpy(raw_data['X_train']).to(dtype)
     train_labels = torch.from_numpy(raw_data['y_train']).long()
     train_targets = torch.from_numpy(raw_data['targets_train']).to(dtype)  # 第129天价格
+    if 'target_returns_train' not in raw_data or 'target_returns_val' not in raw_data:
+        raise KeyError("Dataset must contain schema-safe target_returns_train/target_returns_val")
+    train_target_returns = torch.from_numpy(raw_data['target_returns_train']).to(dtype)
 
     val_inputs = torch.from_numpy(raw_data['X_val']).to(dtype)
     val_labels = torch.from_numpy(raw_data['y_val']).long()
     val_targets = torch.from_numpy(raw_data['targets_val']).to(dtype)
+    val_target_returns = torch.from_numpy(raw_data['target_returns_val']).to(dtype)
 
     test_size_for_time = raw_data['X_test'].shape[0] if 'X_test' in raw_data else 0
     train_time_ids_np, val_time_ids_np, _ = _build_split_time_ids(
@@ -317,11 +323,11 @@ def create_dataset(data_path, dtype, rank, balance_train=True, data_fraction=1.0
 
     # --- 数据子采样：根据data_fraction随机选择训练/验证数据 ---
     if data_fraction < 1.0:
-        train_inputs, train_labels, train_targets, train_time_ids, train_pair_names, train_size_original = sample_tensor_quintuplet(
-            train_inputs, train_labels, train_targets, train_time_ids, train_pair_names, data_fraction
+        train_inputs, train_labels, train_targets, train_target_returns, train_time_ids, train_pair_names, train_size_original = sample_tensor_quintuplet(
+            train_inputs, train_labels, train_targets, train_target_returns, train_time_ids, train_pair_names, data_fraction
         )
-        val_inputs, val_labels, val_targets, val_time_ids, val_pair_names, val_size = sample_tensor_quintuplet(
-            val_inputs, val_labels, val_targets, val_time_ids, val_pair_names, data_fraction
+        val_inputs, val_labels, val_targets, val_target_returns, val_time_ids, val_pair_names, val_size = sample_tensor_quintuplet(
+            val_inputs, val_labels, val_targets, val_target_returns, val_time_ids, val_pair_names, data_fraction
         )
         
         if rank == 0:
@@ -376,8 +382,8 @@ def create_dataset(data_path, dtype, rank, balance_train=True, data_fraction=1.0
     val_indices = np.arange(val_size)
     
     # 创建 Dataset - 添加 targets
-    train_dataset = ForexClassificationDataset(train_inputs, train_labels, train_targets, train_time_ids, train_indices, train_pair_names)
-    val_dataset = ForexClassificationDataset(val_inputs, val_labels, val_targets, val_time_ids, val_indices, val_pair_names)
+    train_dataset = ForexClassificationDataset(train_inputs, train_labels, train_targets, train_target_returns, train_time_ids, train_indices, train_pair_names)
+    val_dataset = ForexClassificationDataset(val_inputs, val_labels, val_targets, val_target_returns, val_time_ids, val_indices, val_pair_names)
     
     if rank == 0:
         print(f"\nDataset loaded & processed:", flush=True)
@@ -418,6 +424,9 @@ def create_test_dataset(data_path, dtype, rank, data_fraction=1.0):
     test_inputs = torch.from_numpy(raw_data['X_test']).to(dtype)
     test_labels = torch.from_numpy(raw_data['y_test']).long()
     test_targets = torch.from_numpy(raw_data['targets_test']).to(dtype)
+    if 'target_returns_test' not in raw_data:
+        raise KeyError("Dataset must contain schema-safe target_returns_test")
+    test_target_returns = torch.from_numpy(raw_data['target_returns_test']).to(dtype)
 
     train_size_for_time = raw_data['X_train'].shape[0] if 'X_train' in raw_data else 0
     val_size_for_time = raw_data['X_val'].shape[0] if 'X_val' in raw_data else 0
@@ -433,8 +442,8 @@ def create_test_dataset(data_path, dtype, rank, data_fraction=1.0):
     test_size_original = test_inputs.shape[0]
 
     if data_fraction < 1.0:
-        test_inputs, test_labels, test_targets, test_time_ids, test_pair_names, test_size = sample_tensor_quintuplet(
-            test_inputs, test_labels, test_targets, test_time_ids, test_pair_names, data_fraction
+        test_inputs, test_labels, test_targets, test_target_returns, test_time_ids, test_pair_names, test_size = sample_tensor_quintuplet(
+            test_inputs, test_labels, test_targets, test_target_returns, test_time_ids, test_pair_names, data_fraction
         )
         if rank == 0:
             print(
@@ -449,7 +458,7 @@ def create_test_dataset(data_path, dtype, rank, data_fraction=1.0):
         print(f"\nTest set loaded: {test_size:,} samples", flush=True)
     
     test_indices = np.arange(test_size)
-    test_dataset = ForexClassificationDataset(test_inputs, test_labels, test_targets, test_time_ids, test_indices, test_pair_names)
+    test_dataset = ForexClassificationDataset(test_inputs, test_labels, test_targets, test_target_returns, test_time_ids, test_indices, test_pair_names)
     
     return test_dataset, test_size
 
